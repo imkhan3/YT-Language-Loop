@@ -1,7 +1,19 @@
 {
   "manifest_version": 2,
   "name": "YouTube Language Loop",
-  "version": "0.2.0",
+  "version": "0.2.1",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "youtube-language-loop@imkhan3.github.io",
+      "strict_min_version": "109.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "120.0"
+    }
+  },
   "description": "Configure subtitle block looping, audio dubbing, and speed ramping for language learning.",
   "permissions": [
     "storage"
