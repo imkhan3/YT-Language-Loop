@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube Language Loop</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div>
+        <h1>Language Loop</h1>
+        <p class="subtitle">Playback &amp; Dubbing Settings</p>
+      </div>
+      <label class="toggle" title="Enable or disable extension">
+        <input type="checkbox" id="enabled" />
+        <span class="toggle-slider"></span>
+      </label>
+    </header>
+
+    <main id="settings-form">
+      <!-- 1. Languages & Loop Size -->
+      <section class="card">
+        <h2>Languages &amp; Loop Size</h2>
+
+        <div class="grid-2">
+          <div class="field">
+            <label for="targetLang">Target Language</label>
+            <select id="targetLang"></select>
+          </div>
+
+          <div class="field">
+            <label for="sourceLang">Source Language</label>
+            <select id="sourceLang"></select>
+          </div>
+        </div>
+
+        <div class="field inline-field">
+          <label for="subtitlesPerLoop">Subtitles before loop</label>
+          <input type="number" id="subtitlesPerLoop" min="1" max="50" step="1" />
+        </div>
+      </section>
+
+      <!-- 2. Playback Sequence -->
+      <section class="card">
+        <div class="section-header">
+          <h2>Playback Sequence</h2>
+          <div class="inline-field compact">
+            <label for="numPlaybacks">Playbacks:</label>
+            <input type="number" id="numPlaybacks" min="1" max="10" step="1" />
+          </div>
+        </div>
+
+        <div id="playback-list" class="playback-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <button type="button" id="resetBtn" class="btn-secondary">Reset Defaults</button>
+      <span id="status" class="status" aria-live="polite">Saved</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
