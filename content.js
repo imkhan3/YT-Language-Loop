@@ -40,6 +40,7 @@
     nextBtn: null,
     loadSrtBtn: null,
     clearSrtBtn: null,
+    mobileTabBtn: null,
     subtitleOverlay: null,
     subtitleTargetLine: null,
     subtitleSourceLine: null
@@ -538,10 +539,33 @@
     const player = document.getElementById("movie_player");
     if (!player) return;
 
-    if (hud.root && player.contains(hud.root)) return;
+    const mobileLayout = window.matchMedia(
+      "(max-width: 700px), (max-height: 500px) and (pointer: coarse)"
+    ).matches;
+    const hudParent = mobileLayout ? document.documentElement : player;
+    if (hud.root && hud.root.isConnected) {
+      if (hud.root.parentElement !== hudParent) hudParent.appendChild(hud.root);
+      return;
+    }
 
     const root = document.createElement("div");
     root.id = "yt-lang-loop-hud";
+
+    const mobileTabBtn = document.createElement("button");
+    mobileTabBtn.type = "button";
+    mobileTabBtn.className = "ytll-mobile-tab";
+    mobileTabBtn.textContent = "Loop";
+    mobileTabBtn.title = "Open loop controls";
+    mobileTabBtn.setAttribute("aria-label", "Open loop controls");
+    mobileTabBtn.setAttribute("aria-expanded", "false");
+    mobileTabBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const isOpen = root.classList.toggle("ytll-mobile-open");
+      mobileTabBtn.title = isOpen ? "Close loop controls" : "Open loop controls";
+      mobileTabBtn.setAttribute("aria-label", mobileTabBtn.title);
+      mobileTabBtn.setAttribute("aria-expanded", String(isOpen));
+    });
 
     const info = document.createElement("div");
     info.className = "ytll-info";
@@ -654,6 +678,7 @@
     actions.appendChild(loadSrtBtn);
     actions.appendChild(clearSrtBtn);
 
+    root.appendChild(mobileTabBtn);
     root.appendChild(info);
     root.appendChild(actions);
     root.appendChild(fileInput);
@@ -670,7 +695,7 @@
     subtitleOverlay.appendChild(subtitleTargetLine);
     subtitleOverlay.appendChild(subtitleSourceLine);
     player.appendChild(subtitleOverlay);
-    player.appendChild(root);
+    hudParent.appendChild(root);
 
     hud = {
       root,
@@ -682,6 +707,7 @@
       nextBtn,
       loadSrtBtn,
       clearSrtBtn,
+      mobileTabBtn,
       subtitleOverlay,
       subtitleTargetLine,
       subtitleSourceLine
@@ -952,6 +978,7 @@
     await loadSettings();
     startLoopTicker();
 
+    window.addEventListener("resize", ensureHudMounted);
     window.addEventListener("yt-navigate-finish", () => {
       setTimeout(initForCurrentVideo, 300);
     });
