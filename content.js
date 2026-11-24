@@ -615,7 +615,9 @@
     const fileInput = document.createElement("input");
     fileInput.type = "file";
     fileInput.accept = ".srt,text/plain";
-    fileInput.hidden = true;
+    fileInput.className = "ytll-file-input";
+    fileInput.tabIndex = -1;
+    fileInput.setAttribute("aria-label", "Choose a dual-language SRT file");
     fileInput.addEventListener("change", () => {
       const file = fileInput.files && fileInput.files[0];
       const videoId = fileInput.dataset.videoId;
@@ -631,7 +633,20 @@
         return;
       }
       fileInput.dataset.videoId = videoId;
-      fileInput.click();
+      try {
+        if (typeof fileInput.showPicker === "function") {
+          fileInput.showPicker();
+        } else {
+          fileInput.click();
+        }
+      } catch (err) {
+        try {
+          fileInput.click();
+        } catch (fallbackErr) {
+          console.error("[YT Lang Loop] Failed to open the SRT file picker:", fallbackErr);
+          setHudStatus(`Could not open the file picker: ${fallbackErr.message || err.message}`);
+        }
+      }
     });
 
     clearSrtBtn.addEventListener("click", (e) => {
