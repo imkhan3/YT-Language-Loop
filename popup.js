@@ -40,6 +40,7 @@ const els = {
   numPlaybacks: document.getElementById("numPlaybacks"),
   playbackList: document.getElementById("playback-list"),
   resetBtn: document.getElementById("resetBtn"),
+  reloadCaptionsBtn: document.getElementById("reloadCaptionsBtn"),
   status: document.getElementById("status")
 };
 
@@ -64,12 +65,18 @@ function normalizeSpeed(val, fallback = 1.0) {
   return Math.round(clamped * 100) / 100;
 }
 
-function showSavedStatus() {
+function showStatus(message, isError = false) {
+  els.status.textContent = message;
+  els.status.classList.toggle("error", isError);
   els.status.classList.add("visible");
   clearTimeout(statusTimer);
   statusTimer = setTimeout(() => {
     els.status.classList.remove("visible");
   }, 1400);
+}
+
+function showSavedStatus() {
+  showStatus("Saved");
 }
 
 async function saveSettings() {
@@ -242,6 +249,29 @@ function renderPlaybacks() {
   els.playbackList.appendChild(frag);
 }
 
+async function reloadCaptions() {
+  els.reloadCaptionsBtn.disabled = true;
+  showStatus("Reloading…");
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!tab || typeof tab.id !== "number") {
+      throw new Error("No active tab found");
+    }
+
+    const result = await browser.tabs.sendMessage(tab.id, { type: "YTLL_RELOAD_CAPTIONS" });
+    if (!result?.ok) {
+      throw new Error(result?.reason || "Could not reload captions on this tab");
+    }
+
+    showStatus(result.manual ? "Manual SRT active" : "Captions reloaded");
+  } catch (err) {
+    console.error("Failed to reload captions:", err);
+    showStatus(`Reload failed: ${err.message}`, true);
+  } finally {
+    els.reloadCaptionsBtn.disabled = false;
+  }
+}
+
 function syncFormFromState() {
   els.enabled.checked = state.enabled;
   els.main.classList.toggle("disabled", !state.enabled);
@@ -294,6 +324,8 @@ function bindEvents() {
     syncFormFromState();
     saveSettings();
   });
+
+  els.reloadCaptionsBtn.addEventListener("click", reloadCaptions);
 }
 
 async function init() {

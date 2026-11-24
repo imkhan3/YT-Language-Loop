@@ -26,6 +26,10 @@
   let transitionInProgress = false;
   let ignoreManualSeekUntil = 0;
   let usingSrt = false;
+  let usingGeneratedSrt = false;
+  let captionLoadError = "";
+  let captionGenerationRequest = 0;
+  let navigationTimer = null;
   let tickTimer = null;
   let reqCounter = 0;
   const pendingRequests = new Map();
@@ -56,7 +60,7 @@
 
   injectPageScript();
 
-  function sendToPage(action, payload = {}) {
+  function sendToPage(action, payload = {}, timeoutMs = 6000) {
     return new Promise((resolve) => {
       const id = ++reqCounter;
       pendingRequests.set(id, resolve);
@@ -67,8 +71,27 @@
           pendingRequests.delete(id);
           resolve({ ok: false, reason: "Timeout communicating with YouTube player" });
         }
-      }, 6000);
+      }, timeoutMs);
     });
+  }
+
+  async function loadLanguageSettings() {
+    let sourceLang = "en";
+    let targetLang = "ar";
+    try {
+      const stored = await browser.storage.local.get("settings");
+      if (typeof stored.settings?.sourceLang === "string" && stored.settings.sourceLang) {
+        sourceLang = stored.settings.sourceLang;
+      }
+      if (typeof stored.settings?.targetLang === "string" && stored.settings.targetLang) {
+        targetLang = stored.settings.targetLang;
+      }
+    } catch (err) {
+      console.error("[YT Lang Loop] Failed to load caption languages:", err);
+    }
+    settings.sourceLang = sourceLang;
+    settings.targetLang = targetLang;
+    return { sourceLang, targetLang };
   }
 
   window.addEventListener("message", (event) => {
@@ -243,6 +266,65 @@
     );
   }
 
+  async function reloadGeneratedCaptions(videoId, languages = null) {
+    const keepManualSrt = usingSrt && !usingGeneratedSrt;
+    const requestId = ++captionGenerationRequest;
+    const { sourceLang, targetLang } = languages || (await loadLanguageSettings());
+    let reason = "Could not generate bilingual subtitles";
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (
+        requestId !== captionGenerationRequest ||
+        currentVideoId !== videoId ||
+        getVideoIdFromUrl() !== videoId
+      ) {
+        return { ok: false, canceled: true };
+      }
+
+      const result = await sendToPage(
+        "GENERATE_BILINGUAL_SRT",
+        { sourceLang, targetLang },
+        12000
+      );
+      if (
+        requestId !== captionGenerationRequest ||
+        getVideoIdFromUrl() !== videoId
+      ) {
+        return { ok: false, canceled: true };
+      }
+
+      if (result?.ok && typeof result.srt === "string") {
+        const segments = parseSrt(result.srt);
+        if (segments.length === 0) {
+          reason = "Generated captions did not contain valid SRT cues";
+          break;
+        }
+
+        if (keepManualSrt) {
+          return { ok: true, manual: true, generatedSegments: segments.length };
+        }
+
+        usingSrt = true;
+        usingGeneratedSrt = true;
+        captionLoadError = "";
+        cues = segments;
+        rebuildBlocksAndSync();
+        updateHud();
+        return { ok: true, segments: segments.length };
+      }
+
+      reason = result?.reason || reason;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+
+    if (!keepManualSrt) {
+      captionLoadError = reason;
+      updateHud();
+    }
+    console.error("[YT Lang Loop] Failed to generate bilingual subtitles:", reason);
+    return { ok: false, reason };
+  }
+
   function isStoredSrt(value) {
     return (
       Array.isArray(value) &&
@@ -262,12 +344,16 @@
     const result = [];
     for (let i = 0; i < cueList.length; i += size) {
       const slice = cueList.slice(i, i + size);
+      const lastCue = slice[slice.length - 1];
+      const nextCue = cueList[i + size];
       result.push({
         index: result.length,
         subStartNum: i + 1,
         subEndNum: i + slice.length,
-        start: Math.max(0, slice[0].start - 0.05),
-        end: slice[slice.length - 1].end + 0.15
+        start: Math.max(0, slice[0].start - 0.03),
+        end: nextCue
+          ? Math.min(lastCue.end + 0.04, nextCue.start - 0.02)
+          : lastCue.end + 0.04
       });
     }
     return result;
@@ -379,6 +465,8 @@
   async function runTransition(nextBlockIdx, nextPassIdx, seekTarget) {
     if (transitionInProgress) return;
     transitionInProgress = true;
+    const video = getVideoElement();
+    const wasMuted = video ? video.muted : false;
 
     try {
       currentBlockIdx = nextBlockIdx;
@@ -386,26 +474,24 @@
       updateHud();
       renderCustomSubtitle();
 
-      const res = await applyPassSettings(currentPassIdx);
-
-      // Let YouTube's audio track swap settle before seeking so it doesn't bounce back
-      if (res?.audioRes?.ok && !res.audioRes.unchanged) {
-        await wait(350);
+      if (video) video.muted = true;
+      const blk = blocks[currentBlockIdx];
+      const blockEnd = blk ? blk.end : seekTarget + 1;
+      const target = seekTarget === null ? null : Math.max(0, seekTarget);
+      if (target !== null) {
+        await seekAndWait(target, blockEnd);
       }
 
-      if (seekTarget !== null) {
-        const blk = blocks[currentBlockIdx];
-        const blockEnd = blk ? blk.end : seekTarget + 1;
-        await seekAndWait(seekTarget, blockEnd);
+      const res = await applyPassSettings(currentPassIdx);
 
-        // If YouTube's audio buffer reload bounced currentTime past blockEnd, seek once more
-        const video = getVideoElement();
-        if (video && blk && video.currentTime >= blk.end - 0.1) {
-          await wait(250);
-          await seekAndWait(seekTarget, blockEnd);
+      if (target !== null && res?.audioRes?.ok && !res.audioRes.unchanged) {
+        await wait(350);
+        if (video && Math.abs(video.currentTime - target) > 0.25) {
+          await seekAndWait(target, blockEnd);
         }
       }
     } finally {
+      if (video) video.muted = wasMuted;
       programmaticSeekTarget = null;
       ignoreManualSeekUntil = Date.now() + 300;
       transitionInProgress = false;
@@ -495,6 +581,7 @@
   }
 
   async function handleSrtFile(file, videoId) {
+    captionGenerationRequest++;
     try {
       const segments = parseSrt(await readFileAsText(file));
       if (segments.length === 0) {
@@ -509,6 +596,8 @@
 
       currentVideoId = videoId;
       usingSrt = true;
+      usingGeneratedSrt = false;
+      captionLoadError = "";
       cues = segments;
       rebuildBlocksAndSync();
       updateHud();
@@ -521,11 +610,14 @@
   async function clearSrtForCurrentVideo() {
     const videoId = getVideoIdFromUrl();
     if (!videoId) return;
+    captionGenerationRequest++;
 
     try {
       await browser.storage.local.remove(`srt_${videoId}`);
       if (getVideoIdFromUrl() !== videoId) return;
       usingSrt = false;
+      usingGeneratedSrt = false;
+      captionLoadError = "";
       cues = [];
       blocks = [];
       await initForCurrentVideo();
@@ -746,8 +838,10 @@
     hud.toggleBtn.classList.toggle("ytll-paused", !loopActive);
 
     if (blocks.length === 0) {
-      hud.statusText.textContent = `Loop: Waiting for "${settings.targetLang}" subtitles...`;
-      hud.metaText.textContent = "";
+      hud.statusText.textContent = captionLoadError
+        ? "Could not load generated captions"
+        : `Loop: Waiting for "${settings.targetLang}" subtitles...`;
+      hud.metaText.textContent = captionLoadError;
       return;
     }
 
@@ -783,6 +877,9 @@
     if (subRes && !subRes.ok) {
       meta += ` (subtitles: ${subRes.reason})`;
     }
+    if (captionLoadError) {
+      meta += ` | ${captionLoadError}`;
+    }
 
     hud.metaText.textContent = meta;
   }
@@ -813,7 +910,9 @@
         video.playbackRate = expectedSpeed;
       }
 
-      if (video.currentTime >= blk.end) {
+      const endThreshold =
+        blk.end - Math.min(0.14, 0.04 * (video.playbackRate || 1));
+      if (video.currentTime >= endThreshold) {
         const totalPasses = settings.numPlaybacks || 1;
 
         if (currentPassIdx < totalPasses - 1) {
@@ -829,7 +928,7 @@
           updateHud();
         }
       }
-    }, 90);
+    }, 30);
   }
 
   function attachVideoListeners() {
@@ -859,8 +958,11 @@
   async function initForCurrentVideo() {
     const videoId = getVideoIdFromUrl();
     if (!videoId) {
+      captionGenerationRequest++;
       currentVideoId = "";
       usingSrt = false;
+      usingGeneratedSrt = false;
+      captionLoadError = "";
       programmaticSeekTarget = null;
       transitionInProgress = false;
       cues = [];
@@ -878,9 +980,12 @@
     }
 
     currentVideoId = videoId;
+    const loadRequest = ++captionGenerationRequest;
     programmaticSeekTarget = null;
     transitionInProgress = false;
     usingSrt = false;
+    usingGeneratedSrt = false;
+    captionLoadError = "";
     cues = [];
     blocks = [];
     currentBlockIdx = 0;
@@ -890,12 +995,16 @@
     attachVideoListeners();
     updateHud();
 
+    const languages = await loadLanguageSettings();
+    if (loadRequest !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) return;
+
     const storageKey = `srt_${videoId}`;
     try {
       const stored = await browser.storage.local.get(storageKey);
-      if (getVideoIdFromUrl() !== videoId) return;
+      if (loadRequest !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) return;
       if (isStoredSrt(stored[storageKey])) {
         usingSrt = true;
+        usingGeneratedSrt = false;
         cues = stored[storageKey];
         rebuildBlocksAndSync();
         updateHud();
@@ -910,13 +1019,28 @@
 
     if (!settings.enabled) return;
 
+    const generated = await reloadGeneratedCaptions(videoId, languages);
+    if (generated.ok || generated.canceled) return;
+
+    const fallbackRequest = captionGenerationRequest;
     // Wait briefly for YouTube player to populate playerResponse
     for (let attempt = 0; attempt < 8; attempt++) {
-      if (getVideoIdFromUrl() !== videoId) return; // navigated away
+      if (
+        fallbackRequest !== captionGenerationRequest ||
+        getVideoIdFromUrl() !== videoId
+      ) {
+        return;
+      }
       if (usingSrt) return;
 
       const res = await sendToPage("FETCH_SUBTITLES", { langCode: settings.targetLang });
-      if (getVideoIdFromUrl() !== videoId || usingSrt) return;
+      if (
+        fallbackRequest !== captionGenerationRequest ||
+        getVideoIdFromUrl() !== videoId ||
+        usingSrt
+      ) {
+        return;
+      }
       if (res?.ok && res.raw) {
         const parsed = parseSubtitles(res.raw);
         if (parsed.length > 0) {
@@ -942,6 +1066,27 @@
     }
   }
 
+  async function reloadCaptionsForCurrentVideo() {
+    const videoId = getVideoIdFromUrl();
+    if (!videoId) {
+      return { ok: false, reason: "Open a YouTube video before reloading captions" };
+    }
+
+    if (videoId !== currentVideoId) {
+      await initForCurrentVideo();
+      if (getVideoIdFromUrl() !== videoId || currentVideoId !== videoId) {
+        return { ok: false, canceled: true };
+      }
+    }
+
+    return reloadGeneratedCaptions(videoId);
+  }
+
+  browser.runtime.onMessage.addListener((message) => {
+    if (message?.type !== "YTLL_RELOAD_CAPTIONS") return undefined;
+    return reloadCaptionsForCurrentVideo();
+  });
+
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.settings) return;
     const prevTarget = settings.targetLang;
@@ -952,6 +1097,22 @@
     settings = { ...structuredClone(DEFAULT_SETTINGS), ...changes.settings.newValue };
 
     const video = getVideoElement();
+    const languagesChanged =
+      settings.targetLang !== prevTarget || settings.sourceLang !== prevSource;
+    if (
+      languagesChanged &&
+      (usingGeneratedSrt || !usingSrt)
+    ) {
+      captionGenerationRequest++;
+      usingSrt = false;
+      usingGeneratedSrt = false;
+      cues = [];
+      blocks = [];
+      if (settings.enabled) initForCurrentVideo();
+      updateHud();
+      return;
+    }
+
     if (!settings.enabled) {
       if (video) video.playbackRate = 1.0;
       updateHud();
@@ -994,9 +1155,16 @@
     startLoopTicker();
 
     window.addEventListener("resize", ensureHudMounted);
-    window.addEventListener("yt-navigate-finish", () => {
-      setTimeout(initForCurrentVideo, 300);
-    });
+    const handleNavigation = () => {
+      clearTimeout(navigationTimer);
+      navigationTimer = setTimeout(initForCurrentVideo, 300);
+    };
+    window.addEventListener("yt-navigate-finish", handleNavigation);
+    document.addEventListener("yt-navigate-finish", handleNavigation);
+    window.addEventListener("popstate", handleNavigation);
+    setInterval(() => {
+      if (getVideoIdFromUrl() !== currentVideoId) initForCurrentVideo();
+    }, 1000);
 
     // Fallback watcher for initial load
     setTimeout(initForCurrentVideo, 800);

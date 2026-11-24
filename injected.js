@@ -314,6 +314,128 @@
     return { ok: false, reason: `Could not load "${langCode}" subtitles for this video` };
   }
 
+  async function generateBilingualSrt(sourceLang = "en", targetLang = "ar") {
+  const player = document.querySelector("#movie_player");
+  const playerResponse = player?.getPlayerResponse?.() || window.ytInitialPlayerResponse;
+  const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+  if (!tracks || tracks.length === 0) {
+    throw new Error("No captions available for this video.");
+  }
+
+  // Prefer manual track over auto-generated (asr)
+  const findBestTrack = (lang) =>
+    tracks.find((t) => t.languageCode === lang && t.kind !== "asr") ||
+    tracks.find((t) => t.languageCode === lang);
+
+  let sourceTrack = findBestTrack(sourceLang);
+  let targetTrack = findBestTrack(targetLang);
+
+  // Fallback: auto-translate from the other track if missing
+  let sourceTlang = null;
+  let targetTlang = null;
+
+  if (!sourceTrack && targetTrack?.isTranslatable) {
+    sourceTrack = targetTrack;
+    sourceTlang = sourceLang;
+  }
+  if (!targetTrack && sourceTrack?.isTranslatable) {
+    targetTrack = sourceTrack;
+    targetTlang = targetLang;
+  }
+
+  // Last resort: use the first translatable track for both
+  if (!sourceTrack || !targetTrack) {
+    const fallback = tracks.find((t) => t.isTranslatable) || tracks[0];
+    if (!sourceTrack) {
+      sourceTrack = fallback;
+      if (fallback.languageCode !== sourceLang) sourceTlang = sourceLang;
+    }
+    if (!targetTrack) {
+      targetTrack = fallback;
+      if (fallback.languageCode !== targetLang) targetTlang = targetLang;
+    }
+  }
+
+  const fetchTrackJson3 = async (track, tlang) => {
+    const url = new URL(track.baseUrl);
+    url.host = location.host; // Keeps it same-origin on both www.youtube.com and m.youtube.com
+    url.searchParams.set("fmt", "json3");
+    if (tlang) url.searchParams.set("tlang", tlang);
+
+    const res = await fetch(url.toString(), { credentials: "include" });
+    if (!res.ok) throw new Error(`Failed to fetch captions (${res.status})`);
+    const text = await res.text();
+    if (!text) throw new Error("Empty caption response (YouTube may require a pot token).");
+    return parseJson3Events(JSON.parse(text).events || []);
+  };
+
+  const [sourceCues, targetCues] = await Promise.all([
+    fetchTrackJson3(sourceTrack, sourceTlang),
+    fetchTrackJson3(targetTrack, targetTlang),
+  ]);
+
+  return buildPairedSrt(sourceCues, targetCues);
+}
+
+function parseJson3Events(events) {
+  const raw = [];
+  for (const ev of events) {
+    if (!ev.segs || typeof ev.tStartMs !== "number") continue;
+    const text = ev.segs
+      .map((s) => s.utf8 || "")
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) continue;
+
+    const startMs = ev.tStartMs;
+    const endMs = startMs + (ev.dDurationMs || 2000);
+    raw.push({ startMs, endMs, text });
+  }
+
+  // Prevent ASR cues from overlapping the next cue
+  for (let i = 0; i < raw.length - 1; i++) {
+    if (raw[i].endMs > raw[i + 1].startMs) {
+      raw[i].endMs = raw[i + 1].startMs;
+    }
+  }
+  return raw;
+}
+
+function buildPairedSrt(sourceCues, targetCues) {
+  const lines = [];
+  let index = 1;
+
+  for (const src of sourceCues) {
+    // Match by midpoint overlap (handles both exact auto-translate & separate native tracks)
+    const matchingTargets = targetCues.filter((tgt) => {
+      const overlap = Math.min(src.endMs, tgt.endMs) - Math.max(src.startMs, tgt.startMs);
+      return overlap > Math.min(src.endMs - src.startMs, tgt.endMs - tgt.startMs) * 0.3;
+    });
+
+    const targetText = matchingTargets.map((t) => t.text).join(" ").trim();
+    const start = formatSrtTime(src.startMs);
+    const end = formatSrtTime(src.endMs);
+
+    lines.push(`${index++}\n${start} --> ${end}\n${src.text}\n`);
+    if (targetText) {
+      lines.push(`${index++}\n${start} --> ${end}\n${targetText}\n`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function formatSrtTime(ms) {
+  const totalMs = Math.max(0, Math.floor(ms));
+  const hours = String(Math.floor(totalMs / 3600000)).padStart(2, "0");
+  const minutes = String(Math.floor((totalMs % 3600000) / 60000)).padStart(2, "0");
+  const seconds = String(Math.floor((totalMs % 60000) / 1000)).padStart(2, "0");
+  const millis = String(totalMs % 1000).padStart(3, "0");
+  return `${hours}:${minutes}:${seconds},${millis}`;
+}
+
   function getCapabilities(targetLang, sourceLang) {
     const player = getPlayer();
     const audioTracks = player?.getAvailableAudioTracks?.() || [];
@@ -341,6 +463,16 @@
 
     if (action === "FETCH_SUBTITLES") {
       result = await fetchSubtitlesForLang(payload.langCode);
+    } else if (action === "GENERATE_BILINGUAL_SRT") {
+      try {
+        const srt = await generateBilingualSrt(
+          payload?.sourceLang || "en",
+          payload?.targetLang || "ar"
+        );
+        result = { ok: true, srt };
+      } catch (err) {
+        result = { ok: false, reason: err?.message || "Could not generate bilingual subtitles" };
+      }
     } else if (action === "APPLY_PASS") {
       const audioRes = await setAudioLanguage(payload.audioLang);
       const subRes = payload.useCustomSubs
