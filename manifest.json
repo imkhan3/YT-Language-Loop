@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "YouTube Language Loop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "browser_specific_settings": {
     "gecko": {
       "id": "youtube-language-loop@imkhan3.github.io",
