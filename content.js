@@ -25,6 +25,9 @@
   let programmaticSeekTarget = null;
   let transitionInProgress = false;
   let ignoreManualSeekUntil = 0;
+  let manualSeeking = false;
+  let lastTickTime = null;
+  let lastProgrammaticSeekTo = null;
   let usingSrt = false;
   let usingGeneratedSrt = false;
   let captionLoadError = "";
@@ -494,6 +497,9 @@
       if (video) video.muted = wasMuted;
       programmaticSeekTarget = null;
       ignoreManualSeekUntil = Date.now() + 300;
+      lastProgrammaticSeekTo = seekTarget === null ? null : Math.max(0, seekTarget);
+      lastTickTime = video ? video.currentTime : null;
+      manualSeeking = false;
       transitionInProgress = false;
       updateHud();
       renderCustomSubtitle();
@@ -888,11 +894,29 @@
     clearInterval(tickTimer);
     tickTimer = setInterval(() => {
       const video = getVideoElement();
+      if (video) attachVideoListeners();
       renderCustomSubtitle();
-      if (!settings.enabled || !loopActive || blocks.length === 0) return;
+      if (!video) {
+        lastTickTime = null;
+        return;
+      }
+
+      const nowTime = video.currentTime;
+      if (
+        blocks.length > 0 &&
+        lastTickTime !== null &&
+        !transitionInProgress &&
+        programmaticSeekTarget === null &&
+        Math.abs(nowTime - lastTickTime) > 0.75
+      ) {
+        currentBlockIdx = findBlockIndexForTime(nowTime);
+        currentPassIdx = 0;
+      }
+      lastTickTime = nowTime;
+
+      if (!settings.enabled || !loopActive || blocks.length === 0 || manualSeeking) return;
 
       if (
-        !video ||
         video.paused ||
         video.seeking ||
         programmaticSeekTarget !== null ||
@@ -910,9 +934,11 @@
         video.playbackRate = expectedSpeed;
       }
 
+      if (nowTime > blocks[blocks.length - 1].end + 0.5) return;
+
       const endThreshold =
         blk.end - Math.min(0.14, 0.04 * (video.playbackRate || 1));
-      if (video.currentTime >= endThreshold) {
+      if (nowTime >= endThreshold) {
         const totalPasses = settings.numPlaybacks || 1;
 
         if (currentPassIdx < totalPasses - 1) {
@@ -936,17 +962,34 @@
     if (!video || video.dataset.ytllAttached) return;
     programmaticSeekTarget = null;
     transitionInProgress = false;
+    ignoreManualSeekUntil = 0;
+    manualSeeking = false;
+    lastTickTime = video.currentTime;
+    lastProgrammaticSeekTo = null;
     video.dataset.ytllAttached = "true";
 
     video.addEventListener("timeupdate", renderCustomSubtitle);
+    video.addEventListener("seeking", () => {
+      if (transitionInProgress || programmaticSeekTarget !== null) return;
+      manualSeeking = true;
+      if (blocks.length === 0) return;
+      currentBlockIdx = findBlockIndexForTime(video.currentTime);
+      currentPassIdx = 0;
+    });
     video.addEventListener("seeked", () => {
-      if (
-        transitionInProgress ||
-        programmaticSeekTarget !== null ||
-        Date.now() < ignoreManualSeekUntil
-      ) {
+      if (transitionInProgress || programmaticSeekTarget !== null) return;
+
+      const isRecentProgrammaticSeek =
+        Date.now() < ignoreManualSeekUntil &&
+        lastProgrammaticSeekTo !== null &&
+        Math.abs(video.currentTime - lastProgrammaticSeekTo) < 0.75;
+      if (isRecentProgrammaticSeek) {
+        manualSeeking = false;
+        lastTickTime = video.currentTime;
         return;
       }
+      manualSeeking = false;
+      lastTickTime = video.currentTime;
       if (!settings.enabled || !loopActive || blocks.length === 0) return;
 
       currentBlockIdx = findBlockIndexForTime(video.currentTime);
@@ -965,6 +1008,10 @@
       captionLoadError = "";
       programmaticSeekTarget = null;
       transitionInProgress = false;
+      ignoreManualSeekUntil = 0;
+      manualSeeking = false;
+      lastTickTime = null;
+      lastProgrammaticSeekTo = null;
       cues = [];
       blocks = [];
       renderCustomSubtitle();
@@ -983,6 +1030,10 @@
     const loadRequest = ++captionGenerationRequest;
     programmaticSeekTarget = null;
     transitionInProgress = false;
+    ignoreManualSeekUntil = 0;
+    manualSeeking = false;
+    lastTickTime = null;
+    lastProgrammaticSeekTo = null;
     usingSrt = false;
     usingGeneratedSrt = false;
     captionLoadError = "";
