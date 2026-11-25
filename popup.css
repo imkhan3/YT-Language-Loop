@@ -119,6 +119,58 @@ main.disabled {
   color: var(--muted);
 }
 
+.tts-card summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.tts-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.tts-card summary::after {
+  content: "+";
+  float: right;
+  font-size: 16px;
+  line-height: 12px;
+}
+
+.tts-card[open] summary::after {
+  content: "−";
+}
+
+.tts-card input[type="text"],
+.tts-card input[type="password"] {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12.5px;
+  background: #fff;
+  color: var(--text);
+}
+
+.tts-card input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.tts-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tts-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 .section-header {
   display: flex;
   justify-content: space-between;

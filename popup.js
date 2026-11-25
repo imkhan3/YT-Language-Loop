@@ -26,10 +26,20 @@ const DEFAULT_SETTINGS = {
   ]
 };
 
+const DEFAULT_TTS_SETTINGS = {
+  dubMode: "auto",
+  azureKey: "",
+  azureRegion: "eastus",
+  azureVoice: "ar-SA-HamedNeural",
+  overflowBehavior: "speedup"
+};
+
 let state = structuredClone(DEFAULT_SETTINGS);
+let ttsSettings = { ...DEFAULT_TTS_SETTINGS };
 // Keeps previously configured rows in memory if user temporarily lowers numPlaybacks
 let playbackCache = structuredClone(DEFAULT_SETTINGS.playbacks);
 let statusTimer = null;
+let testAudio = null;
 
 const els = {
   enabled: document.getElementById("enabled"),
@@ -41,7 +51,15 @@ const els = {
   playbackList: document.getElementById("playback-list"),
   resetBtn: document.getElementById("resetBtn"),
   reloadCaptionsBtn: document.getElementById("reloadCaptionsBtn"),
-  status: document.getElementById("status")
+  status: document.getElementById("status"),
+  dubMode: document.getElementById("dubMode"),
+  azureKey: document.getElementById("azureKey"),
+  azureRegion: document.getElementById("azureRegion"),
+  azureVoice: document.getElementById("azureVoice"),
+  customAzureVoice: document.getElementById("customAzureVoice"),
+  overflowBehavior: document.getElementById("overflowBehavior"),
+  testVoiceBtn: document.getElementById("testVoiceBtn"),
+  clearTtsCacheBtn: document.getElementById("clearTtsCacheBtn")
 };
 
 function populateLanguageSelect(selectEl) {
@@ -72,7 +90,7 @@ function showStatus(message, isError = false) {
   clearTimeout(statusTimer);
   statusTimer = setTimeout(() => {
     els.status.classList.remove("visible");
-  }, 1400);
+  }, isError ? 5000 : 1400);
 }
 
 function showSavedStatus() {
@@ -86,6 +104,93 @@ async function saveSettings() {
     showSavedStatus();
   } catch (err) {
     console.error("Failed to save settings:", err);
+  }
+}
+
+function selectedAzureVoice() {
+  return els.azureVoice.value === "custom"
+    ? els.customAzureVoice.value.trim()
+    : els.azureVoice.value;
+}
+
+async function saveTtsSettings(showSaved = true) {
+  ttsSettings = {
+    dubMode: els.dubMode.value,
+    azureKey: els.azureKey.value,
+    azureRegion: els.azureRegion.value.trim() || DEFAULT_TTS_SETTINGS.azureRegion,
+    azureVoice: selectedAzureVoice() || DEFAULT_TTS_SETTINGS.azureVoice,
+    overflowBehavior: els.overflowBehavior.value
+  };
+  try {
+    await browser.storage.local.set({ ttsSettings });
+    if (showSaved) showSavedStatus();
+    return true;
+  } catch (err) {
+    console.error("Failed to save TTS settings:", err);
+    showStatus(`TTS settings save failed: ${err.message}`, true);
+    return false;
+  }
+}
+
+function syncTtsFormFromSettings() {
+  els.dubMode.value = ttsSettings.dubMode;
+  els.azureKey.value = ttsSettings.azureKey;
+  els.azureRegion.value = ttsSettings.azureRegion;
+  els.overflowBehavior.value = ttsSettings.overflowBehavior;
+
+  const knownVoice = Array.from(els.azureVoice.options).some(option => option.value === ttsSettings.azureVoice);
+  if (knownVoice) {
+    els.azureVoice.value = ttsSettings.azureVoice;
+    els.customAzureVoice.hidden = true;
+  } else {
+    els.azureVoice.value = "custom";
+    els.customAzureVoice.value = ttsSettings.azureVoice;
+    els.customAzureVoice.hidden = false;
+  }
+}
+
+async function testVoice() {
+  els.testVoiceBtn.disabled = true;
+  showStatus("Testing Azure voice…");
+  try {
+    if (!await saveTtsSettings(false)) {
+      throw new Error("Could not save TTS settings. Check the extension's storage permissions.");
+    }
+    const result = await browser.runtime.sendMessage({
+      type: "YTLL_TTS_TEST",
+      azureKey: els.azureKey.value,
+      azureRegion: els.azureRegion.value.trim() || DEFAULT_TTS_SETTINGS.azureRegion,
+      azureVoice: selectedAzureVoice()
+    });
+    if (!result || !result.ok) {
+      throw new Error(result?.reason || "Could not synthesize the test voice.");
+    }
+
+    if (testAudio) testAudio.pause();
+    testAudio = new Audio(`data:${result.mimeType};base64,${result.audioBase64}`);
+    await testAudio.play();
+    showStatus("Playing Fusha voice");
+  } catch (err) {
+    console.error("Azure voice test failed:", err);
+    showStatus(`Voice test failed: ${err.message}`, true);
+  } finally {
+    els.testVoiceBtn.disabled = false;
+  }
+}
+
+async function clearTtsCache() {
+  els.clearTtsCacheBtn.disabled = true;
+  try {
+    const result = await browser.runtime.sendMessage({ type: "YTLL_TTS_CLEAR_CACHE" });
+    if (!result || !result.ok) {
+      throw new Error(result?.reason || "Could not clear the audio cache.");
+    }
+    showStatus("Audio cache cleared");
+  } catch (err) {
+    console.error("Failed to clear TTS cache:", err);
+    showStatus(`Cache clear failed: ${err.message}`, true);
+  } finally {
+    els.clearTtsCacheBtn.disabled = false;
   }
 }
 
@@ -330,6 +435,18 @@ function bindEvents() {
   });
 
   els.reloadCaptionsBtn.addEventListener("click", reloadCaptions);
+
+  els.dubMode.addEventListener("change", () => saveTtsSettings());
+  els.azureKey.addEventListener("change", () => saveTtsSettings());
+  els.azureRegion.addEventListener("change", () => saveTtsSettings());
+  els.azureVoice.addEventListener("change", () => {
+    els.customAzureVoice.hidden = els.azureVoice.value !== "custom";
+    saveTtsSettings();
+  });
+  els.customAzureVoice.addEventListener("change", () => saveTtsSettings());
+  els.overflowBehavior.addEventListener("change", () => saveTtsSettings());
+  els.testVoiceBtn.addEventListener("click", testVoice);
+  els.clearTtsCacheBtn.addEventListener("click", clearTtsCache);
 }
 
 async function init() {
@@ -337,7 +454,19 @@ async function init() {
   populateLanguageSelect(els.sourceLang);
 
   try {
-    const stored = await browser.storage.local.get("settings");
+    const stored = await browser.storage.local.get(["settings", "ttsSettings"]);
+    if (stored.ttsSettings) {
+      const prevTts = stored.ttsSettings;
+      ttsSettings = {
+        dubMode: ["auto", "off", "force"].includes(prevTts.dubMode) ? prevTts.dubMode : DEFAULT_TTS_SETTINGS.dubMode,
+        azureKey: typeof prevTts.azureKey === "string" ? prevTts.azureKey : DEFAULT_TTS_SETTINGS.azureKey,
+        azureRegion: typeof prevTts.azureRegion === "string" ? prevTts.azureRegion : DEFAULT_TTS_SETTINGS.azureRegion,
+        azureVoice: typeof prevTts.azureVoice === "string" ? prevTts.azureVoice : DEFAULT_TTS_SETTINGS.azureVoice,
+        overflowBehavior: ["speedup", "pause"].includes(prevTts.overflowBehavior) ? prevTts.overflowBehavior : DEFAULT_TTS_SETTINGS.overflowBehavior
+      };
+    } else {
+      await browser.storage.local.set({ ttsSettings });
+    }
     if (stored.settings) {
       const prev = stored.settings;
       const oldFirst = typeof prev.firstSpeed === "number" ? prev.firstSpeed : 1.0;
@@ -367,6 +496,7 @@ async function init() {
 
   bindEvents();
   syncFormFromState();
+  syncTtsFormFromSettings();
 }
 
 init();

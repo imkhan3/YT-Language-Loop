@@ -54,6 +54,50 @@
 
         <div id="playback-list" class="playback-list"></div>
       </section>
+
+      <details class="card tts-card">
+        <summary>AI Dubbing (Azure Fusha TTS)</summary>
+        <div class="field">
+          <label for="dubMode">Dubbing mode</label>
+          <select id="dubMode">
+            <option value="auto">Auto when no YouTube dub</option>
+            <option value="force">Always use AI dub</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="azureKey">Azure Speech Key</label>
+          <input type="password" id="azureKey" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="azureRegion">Azure Region</label>
+          <input type="text" id="azureRegion" placeholder="eastus" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="azureVoice">Fusha Voice</label>
+          <select id="azureVoice">
+            <option value="ar-SA-HamedNeural">Arabic (Saudi Arabia) - Hamed</option>
+            <option value="ar-SA-ZariyahNeural">Arabic (Saudi Arabia) - Zariyah</option>
+            <option value="ar-AE-HamdanNeural">Arabic (UAE) - Hamdan</option>
+            <option value="ar-AE-FatimaNeural">Arabic (UAE) - Fatima</option>
+            <option value="ar-JO-TaimNeural">Arabic (Jordan) - Taim</option>
+            <option value="ar-JO-SanaNeural">Arabic (Jordan) - Sana</option>
+            <option value="custom">Custom voice name…</option>
+          </select>
+          <input type="text" id="customAzureVoice" placeholder="Azure voice name" autocomplete="off" hidden />
+        </div>
+        <div class="field">
+          <label for="overflowBehavior">When a dub exceeds its cue</label>
+          <select id="overflowBehavior">
+            <option value="speedup">Speed up to fit (max 1.25x)</option>
+            <option value="pause">Pause video until dub finishes</option>
+          </select>
+        </div>
+        <div class="tts-actions">
+          <button type="button" id="testVoiceBtn" class="btn-secondary">Test Voice</button>
+          <button type="button" id="clearTtsCacheBtn" class="btn-secondary">Clear Audio Cache</button>
+        </div>
+      </details>
     </main>
 
     <footer class="footer">

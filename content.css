@@ -52,6 +52,15 @@
   color: #b8c2d1;
 }
 
+.ytll-meta.ytll-ai-dub-active {
+  color: #8ee6c5;
+  font-weight: 600;
+}
+
+.ytll-meta.ytll-ai-dub-error {
+  color: #ffb1a8;
+}
+
 .ytll-actions {
   display: flex;
   align-items: center;
