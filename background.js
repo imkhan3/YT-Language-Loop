@@ -31,6 +31,12 @@ function escapeXml(text) {
 
 function textToSsml(text, voice) {
   const cleaned = cleanText(text);
+  if (!/[\p{L}\p{N}]/u.test(cleaned)) return "";
+
+  if (!voice.toLowerCase().includes("multilingual")) {
+    return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="ar-SA"><voice name="${escapeXml(voice)}">${escapeXml(cleaned)}</voice></speak>`;
+  }
+
   const parts = cleaned.split(/([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*)*)/g);
   const escapedText = parts.map((part, index) => {
     const escaped = escapeXml(part);
@@ -57,6 +63,10 @@ function validateCredentials(key, region, voice) {
 
 async function requestSpeech(text, key, region, voice) {
   validateCredentials(key, region, voice);
+  const ssml = textToSsml(text, voice.trim());
+  if (!ssml) {
+    throw new Error("No speakable letters or numbers remain after text cleaning.");
+  }
   const response = await fetch(`https://${region.trim()}.tts.speech.microsoft.com/cognitiveservices/v1`, {
     method: "POST",
     headers: {
@@ -64,7 +74,7 @@ async function requestSpeech(text, key, region, voice) {
       "Content-Type": "application/ssml+xml",
       "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3"
     },
-    body: textToSsml(text, voice.trim())
+    body: ssml
   });
 
   if (!response.ok) {

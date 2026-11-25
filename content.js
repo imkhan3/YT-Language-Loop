@@ -60,9 +60,12 @@
   let passSettingsRequestId = 0;
   let dubAudioUrls = new Map();
   let dubPrefetchInFlight = new Map();
+  let dubFailedCueKeys = new Set();
   let dubDesiredCueKeys = new Set();
   let dubPrefetchSignature = "";
   let dubCacheGeneration = 0;
+  let dubPrefetchQueue = [];
+  let dubPrefetchRunning = 0;
   let dubPlaybackRequest = 0;
   let activeDubCueIdx = -1;
   let activeDubPassIdx = -1;
@@ -71,6 +74,8 @@
   let startingDubCueKey = "";
   let finishedDubCueKey = "";
   let waitingForDubEnd = false;
+  let waitingForDubBuffer = false;
+  let pendingBlockTransition = null;
   let dubFeedback = "";
   let dubFeedbackIsError = false;
   let dubFeedbackTimer = null;
@@ -510,15 +515,24 @@
     };
   }
 
-  function showDubFeedback(message, isError = false) {
+  function showDubFeedback(message, isError = false, durationMs = isError ? 6000 : 3500) {
     dubFeedback = `AI Dub: ${message}`;
     dubFeedbackIsError = isError;
     clearTimeout(dubFeedbackTimer);
-    dubFeedbackTimer = setTimeout(() => {
-      dubFeedback = "";
-      dubFeedbackIsError = false;
-      updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
-    }, isError ? 6000 : 3500);
+    if (durationMs > 0) {
+      dubFeedbackTimer = setTimeout(() => {
+        dubFeedback = "";
+        dubFeedbackIsError = false;
+        updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
+      }, durationMs);
+    }
+    updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
+  }
+
+  function clearDubFeedback() {
+    clearTimeout(dubFeedbackTimer);
+    dubFeedback = "";
+    dubFeedbackIsError = false;
     updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
   }
 
@@ -603,7 +617,7 @@
   }
 
   function stopDubPlayback(resumeAfterWait = false) {
-    const shouldResumeVideo = waitingForDubEnd && resumeAfterWait;
+    const shouldResumeVideo = (waitingForDubEnd || waitingForDubBuffer) && resumeAfterWait;
     dubPlaybackRequest += 1;
     dubAudio.pause();
     try {
@@ -616,6 +630,12 @@
     startingDubCueKey = "";
     finishedDubCueKey = "";
     waitingForDubEnd = false;
+    waitingForDubBuffer = false;
+    pendingBlockTransition = null;
+    dubPrefetchSignature = "";
+    dubPrefetchQueue = [];
+    dubDesiredCueKeys = new Set();
+    dubFailedCueKeys.clear();
     if (shouldResumeVideo) {
       const video = getVideoElement();
       if (video?.paused) {
@@ -633,7 +653,9 @@
     }
     dubAudioUrls.clear();
     dubPrefetchInFlight.clear();
+    dubFailedCueKeys.clear();
     dubDesiredCueKeys.clear();
+    dubPrefetchQueue = [];
     dubPrefetchSignature = "";
   }
 
@@ -658,7 +680,6 @@
       dubMuteActive = false;
     }
     stopDubPlayback(resumeAfterWait);
-    clearDubAudioUrls();
   }
 
   function isAiDubCandidate(passResult = currentPassResult) {
@@ -745,15 +766,6 @@
     return `${currentVideoId}::${ttsSettings.azureVoice}::${cueIdx}::${cue.start}::${text}`;
   }
 
-  function pruneDubAudioUrls(keepKeys) {
-    for (const [key, url] of dubAudioUrls) {
-      if (keepKeys.has(key)) continue;
-      if (dubAudio.src === url) stopDubPlayback();
-      URL.revokeObjectURL(url);
-      dubAudioUrls.delete(key);
-    }
-  }
-
   function audioBase64ToBlob(audioBase64, mimeType) {
     const binary = atob(audioBase64);
     const bytes = new Uint8Array(binary.length);
@@ -761,8 +773,9 @@
     return new Blob([bytes], { type: mimeType || "audio/mpeg" });
   }
 
-  function prefetchDubCue(text, key) {
-    if (dubAudioUrls.has(key) || dubPrefetchInFlight.has(key)) return;
+  function prefetchDubCue(entry) {
+    const { text, key } = entry;
+    if (dubAudioUrls.has(key) || dubPrefetchInFlight.has(key)) return Promise.resolve();
     const generation = dubCacheGeneration;
     const videoId = currentVideoId;
     const request = browser.runtime.sendMessage({
@@ -782,25 +795,75 @@
       }
       const url = URL.createObjectURL(audioBase64ToBlob(result.audioBase64, result.mimeType));
       dubAudioUrls.set(key, url);
+      if (key === activeDubCueKey && waitingForDubBuffer) {
+        startDubCue(cues[activeDubCueIdx], key, getVideoElement());
+      }
     }).catch((error) => {
-      if (generation === dubCacheGeneration && videoId === currentVideoId) {
+      if (
+        generation === dubCacheGeneration &&
+        videoId === currentVideoId &&
+        dubDesiredCueKeys.has(key)
+      ) {
+        dubFailedCueKeys.add(key);
         showDubFeedback(error.message || "Cue synthesis failed", true);
         console.error("[YT Lang Loop] AI dub synthesis failed:", error);
+        if (key === activeDubCueKey && waitingForDubBuffer) {
+          waitingForDubBuffer = false;
+          const video = getVideoElement();
+          if (video?.paused) {
+            video.play().catch(playError => {
+              showDubFeedback(playError.message || "Could not resume video after buffering failed", true);
+            });
+          }
+        }
       }
-    }).finally(() => {
+    });
+    dubPrefetchInFlight.set(key, request);
+    return request.finally(() => {
       if (dubPrefetchInFlight.get(key) === request) {
         dubPrefetchInFlight.delete(key);
       }
     });
-    dubPrefetchInFlight.set(key, request);
+  }
+
+  function pumpDubPrefetchQueue() {
+    while (dubPrefetchRunning < 2 && dubPrefetchQueue.length > 0) {
+      const entry = dubPrefetchQueue.shift();
+      if (
+        !dubDesiredCueKeys.has(entry.key) ||
+        dubAudioUrls.has(entry.key) ||
+        dubFailedCueKeys.has(entry.key) ||
+        dubPrefetchInFlight.has(entry.key)
+      ) {
+        continue;
+      }
+
+      dubPrefetchRunning += 1;
+      prefetchDubCue(entry).finally(() => {
+        dubPrefetchRunning -= 1;
+        pumpDubPrefetchQueue();
+      });
+    }
   }
 
   function ensureDubPrefetchForCurrentBlock() {
     if (!shouldUseAiDub()) return;
 
+    const video = getVideoElement();
+    const activeCueIdx = video ? findCueIndexForTime(video.currentTime) : -1;
     const entries = [];
-    for (const block of blocks.slice(currentBlockIdx, currentBlockIdx + 2)) {
-      for (let cueIdx = block.subStartNum - 1; cueIdx < block.subEndNum; cueIdx++) {
+    const lookaheadBlocks = blocks.slice(currentBlockIdx, currentBlockIdx + 2);
+    for (let blockOffset = 0; blockOffset < lookaheadBlocks.length; blockOffset++) {
+      const block = lookaheadBlocks[blockOffset];
+      let firstCueIdx = block.subStartNum - 1;
+      if (
+        blockOffset === 0 &&
+        activeCueIdx >= firstCueIdx &&
+        activeCueIdx < block.subEndNum
+      ) {
+        firstCueIdx = activeCueIdx;
+      }
+      for (let cueIdx = firstCueIdx; cueIdx < block.subEndNum; cueIdx++) {
         const cue = cues[cueIdx];
         if (!cue) continue;
         const text = cueTargetText(cue);
@@ -810,15 +873,14 @@
     }
     if (entries.some(entry => cueNeedsGeneratedTranslation(entry.cue))) {
       dubDesiredCueKeys = new Set();
-      pruneDubAudioUrls(dubDesiredCueKeys);
+      dubPrefetchQueue = [];
       generateBilingualCuesForDubbing(entries.map(entry => entry.cue));
       return;
     }
 
     const keepKeys = new Set(entries.map(entry => entry.key));
     dubDesiredCueKeys = keepKeys;
-    pruneDubAudioUrls(keepKeys);
-    const signature = `${currentVideoId}:${currentBlockIdx}:${ttsSettings.azureVoice}`;
+    const signature = `${currentVideoId}:${currentBlockIdx}:${ttsSettings.azureVoice}:${activeCueIdx}`;
     const currentBlock = blocks[currentBlockIdx];
     const hasMissingTargetText = usingSrt && currentBlock &&
       cues.slice(currentBlock.subStartNum - 1, currentBlock.subEndNum).some(cue => !cueTargetText(cue));
@@ -829,9 +891,12 @@
       } else if (entries.some(entry => !dubAudioUrls.has(entry.key))) {
         showDubFeedback("Preparing cue audio…");
       }
-    }
-    for (const entry of entries) {
-      prefetchDubCue(entry.text, entry.key);
+      dubPrefetchQueue = entries.filter(entry =>
+        !dubAudioUrls.has(entry.key) &&
+        !dubFailedCueKeys.has(entry.key) &&
+        !dubPrefetchInFlight.has(entry.key)
+      );
+      pumpDubPrefetchQueue();
     }
   }
 
@@ -871,7 +936,7 @@
 
   async function startDubCue(cue, key, video) {
     const url = dubAudioUrls.get(key);
-    if (!url || startingDubCueKey === key || loadedDubCueKey === key) return;
+    if (!cue || !video || !url || startingDubCueKey === key || loadedDubCueKey === key) return;
     const requestId = ++dubPlaybackRequest;
     startingDubCueKey = key;
 
@@ -879,8 +944,9 @@
       await loadDubAudioSource(url);
       if (
         requestId !== dubPlaybackRequest ||
+        activeDubCueKey !== key ||
         !shouldUseAiDub() ||
-        video.paused ||
+        (video.paused && !waitingForDubBuffer) ||
         video.seeking ||
         transitionInProgress ||
         manualSeeking
@@ -889,8 +955,7 @@
       }
 
       const passSpeed = computePassSpeed(currentPassIdx);
-      const availableVideoSec =
-        (cue.end - Math.max(video.currentTime, cue.start)) / passSpeed;
+      const availableVideoSec = (cue.end - cue.start) / passSpeed;
       let playbackRate = passSpeed;
       if (
         ttsSettings.overflowBehavior === "speedup" &&
@@ -899,12 +964,13 @@
       ) {
         playbackRate = Math.min(
           passSpeed * (dubAudio.duration / availableVideoSec),
-          passSpeed * 1.25,
+          passSpeed * 1.45,
           2.0
         );
       }
       dubAudio.playbackRate = playbackRate;
       dubAudio.volume = video.volume;
+      finishedDubCueKey = "";
       loadedDubCueKey = key;
       await dubAudio.play();
       dubAudioUnlocked = true;
@@ -913,11 +979,30 @@
         dubAudio.pause();
         return;
       }
+      if (waitingForDubBuffer) {
+        waitingForDubBuffer = false;
+        if (dubFeedback === "AI Dub: Buffering cue…") clearDubFeedback();
+        if (video.paused) {
+          video.play().catch(error => {
+            showDubFeedback(error.message || "Could not resume video after buffering", true);
+          });
+        }
+      }
     } catch (error) {
       if (requestId === dubPlaybackRequest) {
         dubAudioPlayBlocked = true;
+        dubFailedCueKeys.add(key);
+        loadedDubCueKey = "";
         showDubFeedback(error.message || "Could not play synthesized audio", true);
         console.error("[YT Lang Loop] AI dub playback failed:", error);
+        if (waitingForDubBuffer) {
+          waitingForDubBuffer = false;
+          if (video.paused) {
+            video.play().catch(playError => {
+              showDubFeedback(playError.message || "Could not resume video after buffering failed", true);
+            });
+          }
+        }
       }
     } finally {
       if (startingDubCueKey === key) startingDubCueKey = "";
@@ -926,21 +1011,19 @@
 
   function syncDubPlayback(video) {
     if (!shouldUseAiDub() || transitionInProgress || video.seeking || manualSeeking) {
-      if (!waitingForDubEnd) dubAudio.pause();
+      if (!waitingForDubEnd && !waitingForDubBuffer) dubAudio.pause();
       return;
     }
 
-    if (waitingForDubEnd) return;
+    if (waitingForDubEnd || waitingForDubBuffer) return;
 
     const cueIdx = findCueIndexForTime(video.currentTime);
     if (cueIdx < 0) {
-      if (activeDubCueIdx !== -1) stopDubPlayback();
       return;
     }
 
     const cue = cues[cueIdx];
     if (cueNeedsGeneratedTranslation(cue)) {
-      if (activeDubCueIdx !== -1) stopDubPlayback();
       return;
     }
     const text = cueTargetText(cue);
@@ -948,10 +1031,24 @@
     const key = makeDubCueKey(cue, cueIdx, text);
 
     if (cueIdx !== activeDubCueIdx || currentPassIdx !== activeDubPassIdx) {
-      stopDubPlayback();
+      if (!dubAudio.paused && !dubAudio.ended && loadedDubCueKey) return;
       activeDubCueIdx = cueIdx;
       activeDubPassIdx = currentPassIdx;
       activeDubCueKey = key;
+      loadedDubCueKey = "";
+      startingDubCueKey = "";
+      finishedDubCueKey = "";
+    }
+
+    if (dubFailedCueKeys.has(key)) return;
+    if (finishedDubCueKey === key) return;
+    if (!dubAudioUrls.has(key) || startingDubCueKey === key) {
+      if (!video.paused) {
+        waitingForDubBuffer = true;
+        showDubFeedback("Buffering cue…", false, 0);
+        video.pause();
+      }
+      return;
     }
 
     if (loadedDubCueKey === key) {
@@ -975,7 +1072,32 @@
 
   dubAudio.addEventListener("ended", () => {
     finishedDubCueKey = activeDubCueKey;
+    loadedDubCueKey = "";
+    startingDubCueKey = "";
+    dubAudioPlayBlocked = false;
     if (waitingForDubEnd) {
+      const pending = pendingBlockTransition;
+      if (pending) {
+        pendingBlockTransition = null;
+        if (pending.finish) {
+          waitingForDubEnd = false;
+          loopActive = false;
+          setDubMuteActive(false, getVideoElement(), null, false);
+          const video = getVideoElement();
+          if (video) {
+            video.playbackRate = 1.0;
+            if (video.paused) {
+              video.play().catch(error => {
+                showDubFeedback(error.message || "Could not resume video after the final dub", true);
+              });
+            }
+          }
+          updateHud();
+          return;
+        }
+        runTransition(pending.nextBlockIdx, pending.nextPassIdx, pending.seekTarget);
+        return;
+      }
       waitingForDubEnd = false;
       const video = getVideoElement();
       if (video) {
@@ -983,6 +1105,13 @@
           showDubFeedback(error.message || "Could not resume video after the dub", true);
         });
       }
+      return;
+    }
+
+    const video = getVideoElement();
+    if (video && !video.paused && shouldUseAiDub()) {
+      const cueIdx = findCueIndexForTime(video.currentTime);
+      if (cueIdx >= 0 && cueIdx !== activeDubCueIdx) syncDubPlayback(video);
     }
   });
 
@@ -1056,14 +1185,17 @@
 
   async function runTransition(nextBlockIdx, nextPassIdx, seekTarget) {
     if (transitionInProgress) return;
-    transitionInProgress = true;
     const video = getVideoElement();
+    const shouldResumeAfterTransition = Boolean(
+      video && (waitingForDubEnd || waitingForDubBuffer || !video.paused)
+    );
+    transitionInProgress = true;
     const userMuted = video
       ? dubMuteActive
         ? videoMutedBeforeDub
         : video.muted
       : false;
-    stopDubPlayback(true);
+    stopDubPlayback(false);
 
     try {
       currentBlockIdx = nextBlockIdx;
@@ -1099,6 +1231,11 @@
       ensureDubPrefetchForCurrentBlock();
       updateHud();
       renderCustomSubtitle();
+      if (shouldResumeAfterTransition && video?.paused) {
+        video.play().catch(error => {
+          showDubFeedback(error.message || "Could not resume video after transition", true);
+        });
+      }
     }
   }
 
@@ -1553,11 +1690,13 @@
       lastTickTime = nowTime;
 
       if (!settings.enabled || !loopActive || blocks.length === 0 || manualSeeking) {
-        if (!waitingForDubEnd) dubAudio.pause();
+        if (!waitingForDubEnd && !waitingForDubBuffer) dubAudio.pause();
         return;
       }
 
       ensureDubPrefetchForCurrentBlock();
+
+      if (waitingForDubEnd || waitingForDubBuffer) return;
 
       if (
         video.paused ||
@@ -1565,27 +1704,12 @@
         programmaticSeekTarget !== null ||
         transitionInProgress
       ) {
-        if (!waitingForDubEnd) dubAudio.pause();
+        if (!waitingForDubEnd && !waitingForDubBuffer) dubAudio.pause();
         return;
       }
 
       const blk = blocks[currentBlockIdx];
       if (!blk) return;
-
-      if (waitingForDubEnd) return;
-
-      if (
-        shouldUseAiDub() &&
-        ttsSettings.overflowBehavior === "pause" &&
-        activeDubCueIdx >= 0 &&
-        video.currentTime >= cues[activeDubCueIdx]?.end - 0.05 &&
-        !dubAudio.paused &&
-        !dubAudio.ended
-      ) {
-        waitingForDubEnd = true;
-        video.pause();
-        return;
-      }
 
       // Enforce speed in case YouTube resets it
       const expectedSpeed = computePassSpeed(currentPassIdx);
@@ -1593,11 +1717,49 @@
         video.playbackRate = expectedSpeed;
       }
       syncDubPlayback(video);
+      if (waitingForDubEnd || waitingForDubBuffer) return;
 
       if (nowTime > blocks[blocks.length - 1].end + 0.5) return;
 
       const endThreshold =
         blk.end - Math.min(0.14, 0.04 * (video.playbackRate || 1));
+      const dubStillSpeaking =
+        shouldUseAiDub() &&
+        activeDubCueIdx >= 0 &&
+        loadedDubCueKey !== "" &&
+        !dubAudio.paused &&
+        !dubAudio.ended;
+      if (dubStillSpeaking) {
+        const cueEndThreshold = cues[activeDubCueIdx]?.end - 0.05;
+        if (nowTime >= endThreshold) {
+          const totalPasses = settings.numPlaybacks || 1;
+          if (currentPassIdx < totalPasses - 1) {
+            pendingBlockTransition = {
+              nextBlockIdx: currentBlockIdx,
+              nextPassIdx: currentPassIdx + 1,
+              seekTarget: blk.start
+            };
+          } else if (currentBlockIdx < blocks.length - 1) {
+            const nextIdx = currentBlockIdx + 1;
+            pendingBlockTransition = {
+              nextBlockIdx: nextIdx,
+              nextPassIdx: 0,
+              seekTarget: blocks[nextIdx].start
+            };
+          } else {
+            pendingBlockTransition = { finish: true };
+          }
+          waitingForDubEnd = true;
+          video.pause();
+          return;
+        }
+        if (Number.isFinite(cueEndThreshold) && nowTime >= cueEndThreshold) {
+          waitingForDubEnd = true;
+          video.pause();
+          return;
+        }
+      }
+
       if (nowTime >= endThreshold) {
         const totalPasses = settings.numPlaybacks || 1;
 
@@ -1639,7 +1801,7 @@
     video.addEventListener("timeupdate", renderCustomSubtitle);
     video.addEventListener("play", unlockDubAudio);
     video.addEventListener("pause", () => {
-      if (!waitingForDubEnd) dubAudio.pause();
+      if (!waitingForDubEnd && !waitingForDubBuffer) dubAudio.pause();
     });
     video.addEventListener("volumechange", () => {
       if (dubMuteActive && !video.muted) {
@@ -1684,6 +1846,7 @@
     if (!videoId) {
       const previousVideo = getVideoElement();
       setDubMuteActive(false, getVideoElement(), null, false);
+      clearDubAudioUrls();
       if (previousVideo) previousVideo.playbackRate = 1.0;
       captionGenerationRequest++;
       passSettingsRequestId++;
@@ -1718,6 +1881,7 @@
 
     const previousVideo = getVideoElement();
     setDubMuteActive(false, getVideoElement(), null, false);
+    clearDubAudioUrls();
     if (previousVideo) previousVideo.playbackRate = 1.0;
     passSettingsRequestId++;
     clearTimeout(dubFeedbackTimer);
@@ -1839,10 +2003,11 @@
     if (area !== "local") return;
 
     if (changes.ttsSettings) {
+      const previousVoice = ttsSettings.azureVoice;
       ttsSettings = normalizeTtsSettings(changes.ttsSettings.newValue);
       lastMissingKeyNotice = "";
       stopDubPlayback();
-      clearDubAudioUrls();
+      if (previousVoice !== ttsSettings.azureVoice) clearDubAudioUrls();
       syncDubActivation(currentPassResult);
       updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
     }
