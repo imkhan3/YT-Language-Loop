@@ -97,6 +97,13 @@
     return { sourceLang, targetLang };
   }
 
+  function matchesLanguageCode(candidate, configured) {
+    if (typeof candidate !== "string" || typeof configured !== "string") return false;
+    const candidateCode = candidate.toLowerCase();
+    const configuredCode = configured.toLowerCase();
+    return candidateCode === configuredCode || candidateCode.startsWith(`${configuredCode}-`);
+  }
+
   window.addEventListener("message", (event) => {
     if (event.source !== window || !event.data || event.data.source !== SOURCE_PAGE) {
       return;
@@ -109,18 +116,20 @@
       resolve(result);
     }
 
-    // If YouTube naturally fetched target subtitles after navigation, parse them if we have none
     if (
       type === "TIMEDTEXT_CAPTURED" &&
       payload?.videoId === currentVideoId &&
       !usingSrt &&
       cues.length === 0 &&
-      payload.lang.startsWith(settings.targetLang.toLowerCase())
+      (matchesLanguageCode(payload.lang, settings.targetLang) ||
+        matchesLanguageCode(payload.lang, settings.sourceLang))
     ) {
       const parsed = parseSubtitles(payload.raw);
       if (parsed.length > 0) {
         cues = parsed;
+        captionLoadError = "";
         rebuildBlocksAndSync();
+        updateHud();
       }
     }
   });
@@ -341,6 +350,48 @@
           typeof segment.targetText === "string"
       )
     );
+  }
+
+  async function fetchSingleLanguageCaptions(videoId, requestId, maxAttempts = 8) {
+    const languages = [...new Set([settings.targetLang, settings.sourceLang].filter(Boolean))];
+    let reason = `No "${settings.targetLang}" or "${settings.sourceLang}" captions found`;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (requestId !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) {
+        return { ok: false, canceled: true };
+      }
+      if (usingSrt) return { ok: true, manual: true, segments: cues.length };
+      if (cues.length > 0) return { ok: true, segments: cues.length };
+
+      for (const langCode of languages) {
+        const result = await sendToPage("FETCH_SUBTITLES", { langCode });
+        if (requestId !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) {
+          return { ok: false, canceled: true };
+        }
+        if (usingSrt) return { ok: true, manual: true, segments: cues.length };
+        if (cues.length > 0) return { ok: true, segments: cues.length };
+
+        if (result?.ok && result.raw) {
+          const parsed = parseSubtitles(result.raw);
+          if (parsed.length > 0) {
+            cues = parsed;
+            captionLoadError = "";
+            rebuildBlocksAndSync();
+            updateHud();
+            return { ok: true, segments: cues.length };
+          }
+          reason = `Could not parse "${langCode}" YouTube captions`;
+        } else if (result?.reason) {
+          reason = result.reason;
+        }
+      }
+
+      if (attempt < maxAttempts - 1) await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+
+    captionLoadError = reason;
+    updateHud();
+    return { ok: false, reason };
   }
 
   function buildBlocks(cueList, size) {
@@ -844,9 +895,7 @@
     hud.toggleBtn.classList.toggle("ytll-paused", !loopActive);
 
     if (blocks.length === 0) {
-      hud.statusText.textContent = captionLoadError
-        ? "Could not load generated captions"
-        : `Loop: Waiting for "${settings.targetLang}" subtitles...`;
+      hud.statusText.textContent = "Loop: Waiting for captions (enable CC or Load .SRT)...";
       hud.metaText.textContent = captionLoadError;
       return;
     }
@@ -1046,7 +1095,7 @@
     attachVideoListeners();
     updateHud();
 
-    const languages = await loadLanguageSettings();
+    await loadLanguageSettings();
     if (loadRequest !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) return;
 
     const storageKey = `srt_${videoId}`;
@@ -1069,41 +1118,7 @@
     }
 
     if (!settings.enabled) return;
-
-    const generated = await reloadGeneratedCaptions(videoId, languages);
-    if (generated.ok || generated.canceled) return;
-
-    const fallbackRequest = captionGenerationRequest;
-    // Wait briefly for YouTube player to populate playerResponse
-    for (let attempt = 0; attempt < 8; attempt++) {
-      if (
-        fallbackRequest !== captionGenerationRequest ||
-        getVideoIdFromUrl() !== videoId
-      ) {
-        return;
-      }
-      if (usingSrt) return;
-
-      const res = await sendToPage("FETCH_SUBTITLES", { langCode: settings.targetLang });
-      if (
-        fallbackRequest !== captionGenerationRequest ||
-        getVideoIdFromUrl() !== videoId ||
-        usingSrt
-      ) {
-        return;
-      }
-      if (res?.ok && res.raw) {
-        const parsed = parseSubtitles(res.raw);
-        if (parsed.length > 0) {
-          cues = parsed;
-          rebuildBlocksAndSync();
-          return;
-        }
-      }
-      await new Promise((r) => setTimeout(r, 600));
-    }
-
-    updateHud();
+    return fetchSingleLanguageCaptions(videoId, loadRequest);
   }
 
   async function loadSettings() {
@@ -1124,13 +1139,25 @@
     }
 
     if (videoId !== currentVideoId) {
-      await initForCurrentVideo();
+      const initialized = await initForCurrentVideo();
       if (getVideoIdFromUrl() !== videoId || currentVideoId !== videoId) {
         return { ok: false, canceled: true };
       }
+      if (usingSrt) return { ok: true, manual: true, segments: cues.length };
+      if (cues.length > 0) return { ok: true, segments: cues.length };
+      if (initialized?.ok === false) return initialized;
     }
 
-    return reloadGeneratedCaptions(videoId);
+    if (usingSrt) return { ok: true, manual: true, segments: cues.length };
+
+    const requestId = ++captionGenerationRequest;
+    cues = [];
+    blocks = [];
+    currentBlockIdx = 0;
+    currentPassIdx = 0;
+    captionLoadError = "";
+    updateHud();
+    return fetchSingleLanguageCaptions(videoId, requestId);
   }
 
   browser.runtime.onMessage.addListener((message) => {

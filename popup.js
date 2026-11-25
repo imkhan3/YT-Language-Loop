@@ -263,7 +263,11 @@ async function reloadCaptions() {
       throw new Error(result?.reason || "Could not reload captions on this tab");
     }
 
-    showStatus(result.manual ? "Manual SRT active" : "Captions reloaded");
+    showStatus(
+      result.manual
+        ? "Manual SRT active"
+        : `Loaded ${result.segments} caption segments`
+    );
   } catch (err) {
     console.error("Failed to reload captions:", err);
     showStatus(`Reload failed: ${err.message}`, true);
