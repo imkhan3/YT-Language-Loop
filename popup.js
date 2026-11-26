@@ -54,11 +54,13 @@ const els = {
   resetBtn: document.getElementById("resetBtn"),
   reloadCaptionsBtn: document.getElementById("reloadCaptionsBtn"),
   status: document.getElementById("status"),
+  videoCacheStatus: document.getElementById("videoCacheStatus"),
   dubMode: document.getElementById("dubMode"),
   geminiApiKey: document.getElementById("geminiApiKey"),
   geminiModel: document.getElementById("geminiModel"),
   testGeminiBtn: document.getElementById("testGeminiBtn"),
   clearTranslationCacheBtn: document.getElementById("clearTranslationCacheBtn"),
+  clearVideoCacheBtn: document.getElementById("clearVideoCacheBtn"),
   azureKey: document.getElementById("azureKey"),
   azureRegion: document.getElementById("azureRegion"),
   azureVoice: document.getElementById("azureVoice"),
@@ -219,12 +221,85 @@ async function clearTranslationCache() {
     if (!result || !result.ok) {
       throw new Error(result?.reason || "Could not clear the translation cache.");
     }
+    await refreshAfterVideoCacheClear();
     showStatus("Translation cache cleared");
   } catch (err) {
     console.error("Failed to clear translation cache:", err);
     showStatus(`Translation cache clear failed: ${err.message}`, true);
   } finally {
     els.clearTranslationCacheBtn.disabled = false;
+  }
+}
+
+function formatCacheAge(savedAt) {
+  if (!Number.isFinite(savedAt)) return "";
+  const ageMinutes = Math.max(0, Math.floor((Date.now() - savedAt) / 60000));
+  if (ageMinutes < 1) return "saved just now";
+  if (ageMinutes < 60) return `saved ${ageMinutes}m ago`;
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) return `saved ${ageHours}h ago`;
+  return `saved ${Math.floor(ageHours / 24)}d ago`;
+}
+
+async function refreshVideoCacheStatus() {
+  els.videoCacheStatus.textContent = "Video cache: Checking…";
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!tab || typeof tab.id !== "number") {
+      els.videoCacheStatus.textContent = "Video cache: No active tab";
+      return;
+    }
+    const result = await browser.tabs.sendMessage(tab.id, {
+      type: "YTLL_GET_VIDEO_STATUS",
+      sourceLang: state.sourceLang,
+      targetLang: state.targetLang
+    });
+    if (!result?.ok) {
+      throw new Error(result?.reason || "Could not read video cache status.");
+    }
+    if (result.usingSrt) {
+      els.videoCacheStatus.textContent = `Video cache: SRT: ${result.cueCount} segments`;
+      return;
+    }
+    if (!result.stored) {
+      els.videoCacheStatus.textContent = "Video cache: Not stored yet";
+      return;
+    }
+    const age = formatCacheAge(result.savedAt);
+    els.videoCacheStatus.textContent =
+      `Video cache: Stored (${result.translatedCount}/${result.cueCount} cues translated${age ? `, ${age}` : ""})`;
+  } catch (err) {
+    console.error("Failed to load video cache status:", err);
+    els.videoCacheStatus.textContent = "Video cache: Status unavailable";
+  }
+}
+
+async function refreshAfterVideoCacheClear() {
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (tab && typeof tab.id === "number") {
+      await browser.tabs.sendMessage(tab.id, { type: "YTLL_VIDEO_CACHE_CLEARED" });
+    }
+  } catch (error) {
+    console.warn("Could not notify the active tab that video cache was cleared:", error);
+  }
+  await refreshVideoCacheStatus();
+}
+
+async function clearVideoCache() {
+  els.clearVideoCacheBtn.disabled = true;
+  try {
+    const result = await browser.runtime.sendMessage({ type: "YTLL_VIDEO_CACHE_CLEAR" });
+    if (!result?.ok) {
+      throw new Error(result?.reason || "Could not clear the video cache.");
+    }
+    await refreshAfterVideoCacheClear();
+    showStatus("Video cache cleared");
+  } catch (err) {
+    console.error("Failed to clear video cache:", err);
+    showStatus(`Video cache clear failed: ${err.message}`, true);
+  } finally {
+    els.clearVideoCacheBtn.disabled = false;
   }
 }
 
@@ -418,6 +493,7 @@ async function reloadCaptions() {
       throw new Error(result?.reason || "Could not reload captions on this tab");
     }
 
+    await refreshVideoCacheStatus();
     showStatus(
       result.manual
         ? "Manual SRT active"
@@ -499,6 +575,7 @@ function bindEvents() {
   els.overflowBehavior.addEventListener("change", () => saveTtsSettings());
   els.testGeminiBtn.addEventListener("click", testGemini);
   els.clearTranslationCacheBtn.addEventListener("click", clearTranslationCache);
+  els.clearVideoCacheBtn.addEventListener("click", clearVideoCache);
   els.testVoiceBtn.addEventListener("click", testVoice);
   els.clearTtsCacheBtn.addEventListener("click", clearTtsCache);
 }
@@ -555,6 +632,7 @@ async function init() {
   bindEvents();
   syncFormFromState();
   syncTtsFormFromSettings();
+  await refreshVideoCacheStatus();
 }
 
 init();

@@ -76,6 +76,7 @@
         <div class="tts-actions">
           <button type="button" id="testGeminiBtn" class="btn-secondary">Test Gemini</button>
           <button type="button" id="clearTranslationCacheBtn" class="btn-secondary">Clear Translation Cache</button>
+          <button type="button" id="clearVideoCacheBtn" class="btn-secondary">Clear Video Cache</button>
         </div>
         <div class="field">
           <label for="azureKey">Azure Speech Key</label>
@@ -111,6 +112,10 @@
         </div>
       </details>
     </main>
+
+    <div id="videoCacheStatus" class="video-cache-status" role="status" aria-live="polite">
+      Video cache: Checking…
+    </div>
 
     <footer class="footer">
       <button type="button" id="resetBtn" class="btn-secondary">Reset Defaults</button>

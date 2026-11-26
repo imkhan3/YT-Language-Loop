@@ -171,6 +171,16 @@ main.disabled {
   opacity: 0.65;
 }
 
+.video-cache-status {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .section-header {
   display: flex;
   justify-content: space-between;

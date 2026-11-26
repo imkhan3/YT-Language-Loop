@@ -31,6 +31,11 @@
   let cues = [];
   let blocks = [];
   let videoMetadata = { title: "", channel: "" };
+  let videoCacheSource = "none";
+  let videoCacheSavedAt = null;
+  let videoCacheGeneration = 0;
+  let videoCacheSuppressed = false;
+  let videoCacheSavePromise = Promise.resolve();
   let translationQueue = [];
   let translationRunning = false;
   let translationGeneration = 0;
@@ -155,7 +160,7 @@
     return candidateCode === configuredCode || candidateCode.startsWith(`${configuredCode}-`);
   }
 
-  window.addEventListener("message", (event) => {
+  window.addEventListener("message", async (event) => {
     if (event.source !== window || !event.data || event.data.source !== SOURCE_PAGE) {
       return;
     }
@@ -190,6 +195,7 @@
       }
       if (segmented.length > 0) {
         cues = segmented;
+        videoCacheSource = "live";
         captionLoadError = "";
         rebuildBlocksAndSync();
         if (ttsSettings.geminiApiKey.trim()) {
@@ -197,6 +203,7 @@
         } else if (cues.some(cueNeedsGeneratedTranslation)) {
           generateBilingualCuesForDubbing(cues);
         }
+        await saveVideoCache();
         updateHud();
       }
     }
@@ -326,17 +333,20 @@
       const wordCount = sourceText.split(/\s+/).filter(Boolean).length;
       const endsInSentence = /[.!?。！？۔؟]$/.test(sourceText.trim());
 
-      if (endsInSentence) {
+      if (endsInSentence && (duration >= 3.5 || wordCount >= 7)) {
         flush();
         continue;
       }
 
       if (duration > 13 || wordCount > 20) {
-        if (duration <= 13 && wordCount <= 20) continue;
-
         let cutIndex = -1;
+        for (let i = 0; i < current.length - 1; i++) {
+          if (/[.!?。！？۔؟]$/.test(current[i].text.trim())) {
+            cutIndex = i + 1;
+          }
+        }
         for (let i = 0; i < current.length; i++) {
-          if (/[,;，；、]$/.test(current[i].text.trim()) && i < current.length - 1) {
+          if (cutIndex < 0 && /[,;，；、]$/.test(current[i].text.trim()) && i < current.length - 1) {
             cutIndex = i + 1;
           }
         }
@@ -611,6 +621,7 @@
             })();
           if (segmented.length > 0) {
             cues = segmented;
+            videoCacheSource = "live";
             captionLoadError = "";
             rebuildBlocksAndSync();
             if (ttsSettings.geminiApiKey.trim()) {
@@ -618,6 +629,7 @@
             } else if (cues.some(cueNeedsGeneratedTranslation)) {
               generateBilingualCuesForDubbing(cues);
             }
+            await saveVideoCache();
             updateHud();
             return { ok: true, segments: cues.length };
           }
@@ -940,17 +952,51 @@
     }
   }
 
-  function getContextSentences(cueIndex) {
-    const context = [];
-    for (let i = Math.max(0, cueIndex - 3); i < cueIndex; i++) {
-      const cue = cues[i];
-      if (!cue) continue;
-      const source = typeof cue.sourceText === "string" ? cue.sourceText.trim() : "";
-      const target = typeof cue.targetText === "string" ? cue.targetText.trim() : "";
-      if (source && target) context.push(`Source: ${source}\nTarget: ${target}`);
-      else if (source) context.push(`Source: ${source}`);
-    }
-    return context;
+  function saveVideoCache() {
+    if (!currentVideoId || usingSrt || videoCacheSuppressed || cues.length === 0) return Promise.resolve();
+    const videoId = currentVideoId;
+    const generation = videoCacheGeneration;
+    const sourceLang = settings.sourceLang;
+    const targetLang = settings.targetLang;
+    const snapshot = cues.map(cue => ({
+      start: cue.start,
+      end: cue.end,
+      sourceText: cue.sourceText || "",
+      targetText: cue.targetText || ""
+    }));
+    const metadata = { ...videoMetadata };
+
+    videoCacheSavePromise = videoCacheSavePromise.then(async () => {
+      if (videoId !== currentVideoId || generation !== videoCacheGeneration || videoCacheSuppressed) return;
+      const result = await browser.runtime.sendMessage({
+        type: "YTLL_VIDEO_CACHE_PUT",
+        videoId,
+        sourceLang,
+        targetLang,
+        cues: snapshot,
+        metadata
+      });
+      if (!result?.ok) throw new Error(result?.reason || "Could not save this video's caption cache.");
+      if (videoId === currentVideoId && generation === videoCacheGeneration && !videoCacheSuppressed) {
+        videoCacheSavedAt = result.savedAt || Date.now();
+        if (videoCacheSource === "none") videoCacheSource = "live";
+        updateHud();
+      }
+    }).catch(error => {
+      if (videoId === currentVideoId) {
+        console.error("[YT Lang Loop] Failed to save video cache:", error);
+        showDubFeedback(error.message || "Could not save video cache", true);
+      }
+    });
+    return videoCacheSavePromise;
+  }
+
+  async function invalidatePendingTranslationsAndCacheWrites() {
+    translationGeneration += 1;
+    translationQueue = [];
+    translationInFlight.clear();
+    videoCacheGeneration += 1;
+    await videoCacheSavePromise;
   }
 
   function scheduleTranslationBatches() {
@@ -963,45 +1009,39 @@
       return;
     }
 
-    const batches = [];
-    let start = 0;
-    let batchIndex = 0;
-    while (start < cues.length) {
-      const size = batchIndex === 0 ? 10 : 30;
-      const end = Math.min(cues.length, start + size);
-      if (cues.slice(start, end).some(cueNeedsGeneratedTranslation)) {
-        batches.push({ id: batchIndex, start, end });
-      }
-      start = end;
-      batchIndex += 1;
+    const BATCH_SIZE = 25;
+    const currentBlock = blocks[currentBlockIdx];
+    if (!currentBlock) return;
+    const blockStart = currentBlock.subStartNum - 1;
+    const blockEnd = currentBlock.subEndNum;
+    const batchIds = new Set();
+    for (let cueIndex = blockStart; cueIndex < blockEnd; cueIndex++) {
+      batchIds.add(Math.floor(cueIndex / BATCH_SIZE));
     }
 
-    const queuedIds = new Set(translationQueue.map(batch => batch.id));
-    for (const batch of batches) {
-      if (!queuedIds.has(batch.id) && !translationInFlight.has(batch.id)) {
-        translationQueue.push(batch);
-      }
+    const firstBatchId = Math.floor(blockStart / BATCH_SIZE);
+    const firstBatchEnd = Math.min(cues.length, (firstBatchId + 1) * BATCH_SIZE);
+    if (firstBatchEnd - blockEnd <= 5 && firstBatchEnd < cues.length) {
+      batchIds.add(firstBatchId + 1);
     }
-
-    const activeBatchIds = new Set();
-    const firstCueIndex = blocks[currentBlockIdx]?.subStartNum - 1;
     const nextBlock = blocks[currentBlockIdx + 1];
-    const nextFirstCueIndex = nextBlock ? nextBlock.subStartNum - 1 : cues.length;
-    if (Number.isInteger(firstCueIndex) && firstCueIndex >= 0) {
-      for (const batch of batches) {
-        if (batch.start <= firstCueIndex && firstCueIndex < batch.end) activeBatchIds.add(batch.id);
-      }
-    }
-    for (const batch of batches) {
-      if (batch.start <= nextFirstCueIndex && nextFirstCueIndex < batch.end) activeBatchIds.add(batch.id);
+    if (nextBlock) {
+      const nextBlockStart = nextBlock.subStartNum - 1;
+      const nextBatchId = Math.floor(nextBlockStart / BATCH_SIZE);
+      if (nextBatchId > firstBatchId) batchIds.add(nextBatchId);
     }
 
-    translationQueue.sort((a, b) => {
-      const aPriority = activeBatchIds.has(a.id) ? (a.start <= (firstCueIndex || 0) ? 0 : 1) : 2;
-      const bPriority = activeBatchIds.has(b.id) ? (b.start <= (firstCueIndex || 0) ? 0 : 1) : 2;
-      if (aPriority !== bPriority) return aPriority - bPriority;
-      return a.id - b.id;
-    });
+    translationQueue = Array.from(batchIds)
+      .sort((a, b) => a - b)
+      .map(id => ({
+        id,
+        start: id * BATCH_SIZE,
+        end: Math.min(cues.length, (id + 1) * BATCH_SIZE)
+      }))
+      .filter(batch =>
+        !translationInFlight.has(batch.id) &&
+        cues.slice(batch.start, batch.end).some(cueNeedsGeneratedTranslation)
+      );
 
     pumpTranslationQueue();
   }
@@ -1017,30 +1057,45 @@
 
         const generation = translationGeneration;
         const videoId = currentVideoId;
+        const cueList = cues;
         translationInFlight.add(batch.id);
         try {
+          const batchItems = [];
           for (let cueIndex = batch.start; cueIndex < batch.end; cueIndex++) {
-            if (generation !== translationGeneration || videoId !== currentVideoId) break;
-            const cue = cues[cueIndex];
-            if (!cue || cue.targetText?.trim()) continue;
-            const sourceText = typeof cue.sourceText === "string"
+            const cue = cueList[cueIndex];
+            if (!cue || !cueNeedsGeneratedTranslation(cue)) continue;
+            const text = typeof cue.sourceText === "string"
               ? cue.sourceText.trim()
               : (typeof cue.text === "string" ? cue.text.trim() : "");
-            if (!sourceText) continue;
-
-            const result = await browser.runtime.sendMessage({
-              type: "YTLL_TRANSLATE",
-              text: sourceText,
-              sourceLang: settings.sourceLang,
-              targetLang: settings.targetLang,
-              contextSentences: getContextSentences(cueIndex)
+            if (!text) continue;
+            batchItems.push({
+              index: cueIndex,
+              text,
+              prevContext: cueList
+                .slice(Math.max(0, cueIndex - 2), cueIndex)
+                .map(previous => typeof previous.sourceText === "string" ? previous.sourceText.trim() : "")
+                .filter(Boolean)
             });
-            if (!result?.ok) throw new Error(result?.reason || "Translation failed");
-            if (generation !== translationGeneration || videoId !== currentVideoId) break;
-            cue.targetText = result.translatedText.trim();
+          }
+          if (batchItems.length > 0) {
+            const result = await browser.runtime.sendMessage({
+              type: "YTLL_TRANSLATE_BATCH",
+              items: batchItems,
+              sourceLang: settings.sourceLang,
+              targetLang: settings.targetLang
+            });
+            if (!result?.ok) throw new Error(result?.reason || "Translation batch failed");
+            if (generation === translationGeneration && videoId === currentVideoId && cueList === cues) {
+              for (const item of batchItems) {
+                const translatedText = result.translations?.[item.index];
+                if (cueList[item.index] && typeof translatedText === "string" && translatedText.trim()) {
+                  cueList[item.index].targetText = translatedText.trim();
+                }
+              }
+            }
           }
         } catch (error) {
-          if (generation === translationGeneration && videoId === currentVideoId) {
+          if (generation === translationGeneration && videoId === currentVideoId && cueList === cues) {
             showDubFeedback(error.message || "Translation failed", true);
           }
         } finally {
@@ -1048,6 +1103,7 @@
         }
 
         if (generation === translationGeneration && videoId === currentVideoId) {
+          await saveVideoCache();
           renderCustomSubtitle();
           ensureDubPrefetchForCurrentBlock();
           updateHud();
@@ -1070,76 +1126,268 @@
     return new Blob([bytes], { type: mimeType || "audio/mpeg" });
   }
 
-  function prefetchDubCue(entry) {
-    const { text, key } = entry;
-    if (dubAudioUrls.has(key) || dubPrefetchInFlight.has(key)) return Promise.resolve();
+  function base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function findBatchSilences(audioBuffer) {
+    const sampleRate = audioBuffer.sampleRate;
+    const windowSize = Math.max(1, Math.floor(sampleRate * 0.01));
+    const minFrames = Math.ceil(sampleRate * 0.55);
+    const channels = Array.from({ length: audioBuffer.numberOfChannels }, (_, i) => audioBuffer.getChannelData(i));
+    const runs = [];
+    let runStart = -1;
+
+    for (let frame = 0; frame < audioBuffer.length; frame += windowSize) {
+      const end = Math.min(audioBuffer.length, frame + windowSize);
+      let peak = 0;
+      for (const channel of channels) {
+        for (let i = frame; i < end; i++) peak = Math.max(peak, Math.abs(channel[i]));
+      }
+      if (peak < 0.005) {
+        if (runStart < 0) runStart = frame;
+      } else if (runStart >= 0) {
+        if (runStart > 0 && frame < audioBuffer.length && frame - runStart >= minFrames) {
+          runs.push({ start: runStart, end: frame });
+        }
+        runStart = -1;
+      }
+    }
+    return runs;
+  }
+
+  function encodeMonoWav(audioBuffer, startFrame, endFrame) {
+    const sampleRate = audioBuffer.sampleRate;
+    const frameCount = endFrame - startFrame;
+    if (frameCount <= 0) return null;
+    const channelData = Array.from(
+      { length: audioBuffer.numberOfChannels },
+      (_, i) => audioBuffer.getChannelData(i)
+    );
+    const buffer = new ArrayBuffer(44 + frameCount * 2);
+    const view = new DataView(buffer);
+    const writeString = (offset, value) => {
+      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + frameCount * 2, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, "data");
+    view.setUint32(40, frameCount * 2, true);
+    for (let i = 0; i < frameCount; i++) {
+      let sample = 0;
+      for (const channel of channelData) sample += channel[startFrame + i] / channelData.length;
+      const clamped = Math.max(-1, Math.min(1, sample));
+      view.setInt16(44 + i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    }
+    return buffer;
+  }
+
+  async function splitBatchAudio(batchAudioBase64, itemCount) {
+    const OfflineContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OfflineContext || itemCount < 2) return null;
+    const decoder = new OfflineContext(1, 1, 44100);
+    const decoded = await decoder.decodeAudioData(base64ToArrayBuffer(batchAudioBase64));
+    const silences = findBatchSilences(decoded);
+    if (silences.length !== itemCount - 1) return null;
+
+    const selected = silences.sort((a, b) => a.start - b.start);
+    const paddingFrames = Math.floor(decoded.sampleRate * 0.04);
+    const ranges = [];
+    let startFrame = 0;
+    for (const silence of selected) {
+      const midpoint = Math.floor((silence.start + silence.end) / 2);
+      const endFrame = Math.max(startFrame, midpoint - paddingFrames);
+      ranges.push([startFrame, endFrame]);
+      startFrame = Math.min(decoded.length, midpoint + paddingFrames);
+    }
+    ranges.push([startFrame, decoded.length]);
+    if (ranges.length !== itemCount || ranges.some(([start, end]) => end - start < decoded.sampleRate * 0.08)) {
+      return null;
+    }
+    return ranges.map(([start, end]) => encodeMonoWav(decoded, start, end));
+  }
+
+  function markDubCueFailed(entry, error) {
+    if (dubCacheGeneration !== entry.generation ||
+        entry.videoId !== currentVideoId ||
+        !dubDesiredCueKeys.has(entry.key)) return;
+    dubFailedCueKeys.add(entry.key);
+    showDubFeedback(error.message || "Cue synthesis failed", true);
+    console.error("[YT Lang Loop] AI dub synthesis failed:", error);
+    if (entry.key === activeDubCueKey && waitingForDubBuffer) {
+      waitingForDubBuffer = false;
+      const video = getVideoElement();
+      if (video?.paused) {
+        video.play().catch(playError => {
+          showDubFeedback(playError.message || "Could not resume video after buffering failed", true);
+        });
+      }
+    }
+  }
+
+  function storeDubCueAudio(entry, audioBase64, mimeType) {
+    if (
+      entry.generation !== dubCacheGeneration ||
+      entry.videoId !== currentVideoId ||
+      !dubDesiredCueKeys.has(entry.key)
+    ) return;
+    const url = URL.createObjectURL(audioBase64ToBlob(audioBase64, mimeType));
+    const previousUrl = dubAudioUrls.get(entry.key);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    dubAudioUrls.set(entry.key, url);
+    if (entry.key === activeDubCueKey && waitingForDubBuffer) {
+      startDubCue(cues[entry.cueIdx], entry.key, getVideoElement());
+    }
+  }
+
+  async function synthesizeCueIndividually(entry) {
+    const result = await browser.runtime.sendMessage({
+      type: "YTLL_TTS_SYNTHESIZE",
+      text: entry.text,
+      voice: ttsSettings.azureVoice
+    });
+    if (!result?.ok || !result.audioBase64) {
+      throw new Error(result?.reason || "Could not synthesize this cue.");
+    }
+    storeDubCueAudio(entry, result.audioBase64, result.mimeType);
+  }
+
+  async function prefetchDubBatch(entries) {
     const generation = dubCacheGeneration;
     const videoId = currentVideoId;
-    const request = browser.runtime.sendMessage({
-      type: "YTLL_TTS_SYNTHESIZE",
-      text,
-      voice: ttsSettings.azureVoice
-    }).then((result) => {
-      if (!result?.ok) {
-        throw new Error(result?.reason || "Could not synthesize this cue");
+    const activeEntries = entries.map(entry => ({ ...entry, generation, videoId }));
+    try {
+      const result = await browser.runtime.sendMessage({
+        type: "YTLL_TTS_SYNTHESIZE_BATCH",
+        items: activeEntries.map(entry => ({ key: entry.key, text: entry.text })),
+        voice: ttsSettings.azureVoice
+      });
+      if (!result?.ok) throw new Error(result?.reason || "Could not synthesize these cues.");
+      if (generation !== dubCacheGeneration || videoId !== currentVideoId) return;
+
+      const byKey = new Map(activeEntries.map(entry => [entry.key, entry]));
+      for (const cached of result.cachedItems || []) {
+        const entry = byKey.get(cached.clientKey);
+        if (entry && cached.audioBase64) storeDubCueAudio(entry, cached.audioBase64, cached.mimeType);
       }
-      if (
-        generation !== dubCacheGeneration ||
-        videoId !== currentVideoId ||
-        !dubDesiredCueKeys.has(key)
-      ) {
-        return;
+
+      const batchedItems = Array.isArray(result.batchedItems) ? result.batchedItems : [];
+      let splitAudio = null;
+      if (result.batchAudioBase64 && batchedItems.length > 0) {
+        try {
+          splitAudio = await splitBatchAudio(
+            result.batchAudioBase64,
+            batchedItems.length
+          );
+        } catch (error) {
+          console.warn("[YT Lang Loop] Could not decode batched speech audio; retrying cues individually:", error);
+        }
       }
-      const url = URL.createObjectURL(audioBase64ToBlob(result.audioBase64, result.mimeType));
-      dubAudioUrls.set(key, url);
-      if (key === activeDubCueKey && waitingForDubBuffer) {
-        startDubCue(cues[activeDubCueIdx], key, getVideoElement());
-      }
-    }).catch((error) => {
-      if (
-        generation === dubCacheGeneration &&
-        videoId === currentVideoId &&
-        dubDesiredCueKeys.has(key)
-      ) {
-        dubFailedCueKeys.add(key);
-        showDubFeedback(error.message || "Cue synthesis failed", true);
-        console.error("[YT Lang Loop] AI dub synthesis failed:", error);
-        if (key === activeDubCueKey && waitingForDubBuffer) {
-          waitingForDubBuffer = false;
-          const video = getVideoElement();
-          if (video?.paused) {
-            video.play().catch(playError => {
-              showDubFeedback(playError.message || "Could not resume video after buffering failed", true);
-            });
+
+      if (splitAudio) {
+        for (let i = 0; i < batchedItems.length; i++) {
+          const entry = byKey.get(batchedItems[i].clientKey);
+          if (!entry || !splitAudio[i]) continue;
+          const audioBase64 = arrayBufferToBase64(splitAudio[i]);
+          storeDubCueAudio(entry, audioBase64, "audio/wav");
+          browser.runtime.sendMessage({
+            type: "YTLL_TTS_CACHE_PUT",
+            text: entry.text,
+            audioBase64,
+            mimeType: "audio/wav",
+            voice: ttsSettings.azureVoice
+          }).then(cacheResult => {
+            if (!cacheResult?.ok) throw new Error(cacheResult?.reason || "Could not persist split cue audio.");
+          }).catch(error => {
+            console.error("[YT Lang Loop] Failed to persist split cue audio:", error);
+            if (generation === dubCacheGeneration && videoId === currentVideoId) {
+              showDubFeedback(error.message || "Could not cache split cue audio", true);
+            }
+          });
+        }
+      } else {
+        const fallbackItems = batchedItems
+          .map(item => byKey.get(item.clientKey))
+          .filter(Boolean);
+        for (const entry of fallbackItems) {
+          try {
+            await synthesizeCueIndividually(entry);
+          } catch (error) {
+            markDubCueFailed(entry, error);
           }
         }
       }
-    });
-    dubPrefetchInFlight.set(key, request);
-    return request.finally(() => {
-      if (dubPrefetchInFlight.get(key) === request) {
-        dubPrefetchInFlight.delete(key);
+
+      for (const failed of result.failedItems || []) {
+        const entry = byKey.get(failed.clientKey);
+        if (!entry) continue;
+        try {
+          await synthesizeCueIndividually(entry);
+        } catch (error) {
+          markDubCueFailed(entry, error);
+        }
       }
-    });
+    } catch (error) {
+      for (const entry of activeEntries) markDubCueFailed(entry, error);
+    }
   }
 
   function pumpDubPrefetchQueue() {
     while (dubPrefetchRunning < 2 && dubPrefetchQueue.length > 0) {
-      const entry = dubPrefetchQueue.shift();
-      if (
-        !dubDesiredCueKeys.has(entry.key) ||
-        dubAudioUrls.has(entry.key) ||
-        dubFailedCueKeys.has(entry.key) ||
-        dubPrefetchInFlight.has(entry.key)
-      ) {
-        continue;
+      const batch = [];
+      let chars = 0;
+      while (dubPrefetchQueue.length > 0 && batch.length < 8) {
+        const entry = dubPrefetchQueue[0];
+        if (
+          !dubDesiredCueKeys.has(entry.key) ||
+          dubAudioUrls.has(entry.key) ||
+          dubFailedCueKeys.has(entry.key) ||
+          dubPrefetchInFlight.has(entry.key)
+        ) {
+          dubPrefetchQueue.shift();
+          continue;
+        }
+        const nextChars = entry.text.length;
+        if (batch.length > 0 && chars + nextChars > 2200) break;
+        dubPrefetchQueue.shift();
+        batch.push(entry);
+        chars += nextChars;
       }
+      if (batch.length === 0) break;
 
       dubPrefetchRunning += 1;
-      prefetchDubCue(entry).finally(() => {
+      const request = prefetchDubBatch(batch).finally(() => {
+        for (const entry of batch) {
+          if (dubPrefetchInFlight.get(entry.key) === request) {
+            dubPrefetchInFlight.delete(entry.key);
+          }
+        }
         dubPrefetchRunning -= 1;
         pumpDubPrefetchQueue();
       });
+      for (const entry of batch) dubPrefetchInFlight.set(entry.key, request);
     }
   }
 
@@ -1171,10 +1419,7 @@
       }
     }
     if (cuesNeedingTranslation.length > 0) {
-      dubDesiredCueKeys = new Set();
-      dubPrefetchQueue = [];
       generateBilingualCuesForDubbing(cuesNeedingTranslation);
-      return;
     }
 
     const keepKeys = new Set(entries.map(entry => entry.key));
@@ -1190,13 +1435,13 @@
       } else if (entries.some(entry => !dubAudioUrls.has(entry.key))) {
         showDubFeedback("Preparing cue audio…");
       }
-      dubPrefetchQueue = entries.filter(entry =>
-        !dubAudioUrls.has(entry.key) &&
-        !dubFailedCueKeys.has(entry.key) &&
-        !dubPrefetchInFlight.has(entry.key)
-      );
-      pumpDubPrefetchQueue();
     }
+    dubPrefetchQueue = entries.filter(entry =>
+      !dubAudioUrls.has(entry.key) &&
+      !dubFailedCueKeys.has(entry.key) &&
+      !dubPrefetchInFlight.has(entry.key)
+    );
+    pumpDubPrefetchQueue();
   }
 
   function loadDubAudioSource(url) {
@@ -1582,7 +1827,6 @@
     clearDubAudioUrls();
     translationGeneration += 1;
     translationQueue = [];
-    translationRunning = false;
     translationInFlight.clear();
     blocks = buildBlocks(cues, settings.subtitlesPerLoop || 5);
     const video = getVideoElement();
@@ -1594,6 +1838,9 @@
     }
     updateHud();
     renderCustomSubtitle();
+    if (!usingSrt && ttsSettings.geminiApiKey.trim()) {
+      scheduleTranslationBatches();
+    }
   }
 
   function hasCustomOverlaySubs() {
@@ -1667,6 +1914,8 @@
       currentVideoId = videoId;
       usingSrt = true;
       usingGeneratedSrt = false;
+      videoCacheSource = "none";
+      videoCacheSavedAt = null;
       captionLoadError = "";
       generatedCueAttemptVideoId = "";
       cues = segments;
@@ -1903,6 +2152,14 @@
     };
   }
 
+  function videoStorageStatus() {
+    if (usingSrt) return `SRT: ${cues.length} segments`;
+    if (videoCacheSource === "none") return "Not stored";
+    if (!videoCacheSavedAt) return "Not stored";
+    const ageHours = Math.floor(Math.max(0, Date.now() - videoCacheSavedAt) / 3600000);
+    return ageHours > 0 ? `Stored (${ageHours}h ago)` : "Stored";
+  }
+
   function updateHud(caps, audioRes, subRes) {
     if (!hud.root) ensureHudMounted();
     if (!hud.root) return;
@@ -1923,7 +2180,7 @@
 
     if (blocks.length === 0) {
       hud.statusText.textContent = "Loop: Waiting for captions (enable CC or Load .SRT)...";
-      hud.metaText.textContent = [captionLoadError, dubFeedback].filter(Boolean).join(" | ");
+      hud.metaText.textContent = [videoStorageStatus(), captionLoadError, dubFeedback].filter(Boolean).join(" | ");
       return;
     }
 
@@ -1931,6 +2188,7 @@
       hud.statusText.textContent = "Loop Paused (1.00x)";
       hud.metaText.textContent = [
         `Block ${currentBlockIdx + 1}/${blocks.length}`,
+        videoStorageStatus(),
         dubFeedback
       ].filter(Boolean).join(" | ");
       return;
@@ -1955,7 +2213,7 @@
     const audioDescription = dubMuteActive
       ? `Audio: ${cfg.audioLang} (AI Dub)`
       : `Audio: ${cfg.audioLang}`;
-    let meta = `${usingSrt ? `SRT: ${cues.length} segments | ` : ""}${audioDescription} | Subs: ${subDisplay}`;
+    let meta = `${videoStorageStatus()} | ${audioDescription} | Subs: ${subDisplay}`;
 
     if (!dubMuteActive) {
       if (caps && caps.audioTrackCount <= 1) {
@@ -2169,6 +2427,10 @@
       dubFeedback = "";
       dubFeedbackIsError = false;
       currentVideoId = "";
+      videoCacheSource = "none";
+      videoCacheSavedAt = null;
+      videoCacheSuppressed = false;
+      videoMetadata = { title: "", channel: "" };
       currentPassResult = null;
       generatedCueAttemptVideoId = "";
       usingSrt = false;
@@ -2203,6 +2465,10 @@
     dubFeedback = "";
     dubFeedbackIsError = false;
     currentVideoId = videoId;
+    videoCacheSource = "none";
+    videoCacheSavedAt = null;
+    videoCacheSuppressed = false;
+    videoMetadata = { title: "", channel: "" };
     currentPassResult = null;
     generatedCueAttemptVideoId = "";
     lastMissingKeyNotice = "";
@@ -2245,6 +2511,38 @@
       }
     } catch (err) {
       console.error("[YT Lang Loop] Failed to load saved SRT:", err);
+    }
+
+    try {
+      const cached = await browser.runtime.sendMessage({
+        type: "YTLL_VIDEO_CACHE_GET",
+        videoId,
+        sourceLang: settings.sourceLang,
+        targetLang: settings.targetLang
+      });
+      if (loadRequest !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) return;
+      if (cached?.ok && cached.found && isStoredSrt(cached.cues)) {
+        cues = cached.cues;
+        videoMetadata = {
+          title: typeof cached.metadata?.title === "string" ? cached.metadata.title : "",
+          channel: typeof cached.metadata?.channel === "string" ? cached.metadata.channel : ""
+        };
+        videoCacheSource = "cache";
+        videoCacheSavedAt = Number.isFinite(cached.updatedAt) ? cached.updatedAt : null;
+        rebuildBlocksAndSync();
+        if (ttsSettings.geminiApiKey.trim() && cues.some(cueNeedsGeneratedTranslation)) {
+          scheduleTranslationBatches();
+        } else if (cues.some(cueNeedsGeneratedTranslation)) {
+          generateBilingualCuesForDubbing(cues);
+        }
+        updateHud();
+        return;
+      }
+      if (cached && !cached.ok) {
+        console.error("[YT Lang Loop] Failed to load video cache:", cached.reason);
+      }
+    } catch (err) {
+      console.error("[YT Lang Loop] Failed to load video cache:", err);
     }
 
     if (!settings.enabled) return;
@@ -2291,6 +2589,17 @@
     }
 
     if (videoId !== currentVideoId) {
+      await loadLanguageSettings();
+      videoCacheSuppressed = true;
+      await invalidatePendingTranslationsAndCacheWrites();
+      const deleted = await browser.runtime.sendMessage({
+        type: "YTLL_VIDEO_CACHE_DELETE",
+        videoId,
+        sourceLang: settings.sourceLang,
+        targetLang: settings.targetLang
+      });
+      if (!deleted?.ok) throw new Error(deleted?.reason || "Could not delete the saved video cache.");
+      videoCacheSuppressed = false;
       const initialized = await initForCurrentVideo();
       if (getVideoIdFromUrl() !== videoId || currentVideoId !== videoId) {
         return { ok: false, canceled: true };
@@ -2302,6 +2611,16 @@
 
     if (usingSrt) return { ok: true, manual: true, segments: cues.length };
 
+    videoCacheSuppressed = true;
+    await invalidatePendingTranslationsAndCacheWrites();
+    const deleted = await browser.runtime.sendMessage({
+      type: "YTLL_VIDEO_CACHE_DELETE",
+      videoId,
+      sourceLang: settings.sourceLang,
+      targetLang: settings.targetLang
+    });
+    if (!deleted?.ok) throw new Error(deleted?.reason || "Could not delete the saved video cache.");
+    videoCacheSuppressed = false;
     const requestId = ++captionGenerationRequest;
     passSettingsRequestId++;
     setDubMuteActive(false, getVideoElement());
@@ -2310,14 +2629,78 @@
     currentBlockIdx = 0;
     currentPassIdx = 0;
     generatedCueAttemptVideoId = "";
+    videoCacheSource = "none";
+    videoCacheSavedAt = null;
+    videoMetadata = { title: "", channel: "" };
     captionLoadError = "";
     updateHud();
     return fetchSingleLanguageCaptions(videoId, requestId);
   }
 
-  browser.runtime.onMessage.addListener((message) => {
-    if (message?.type !== "YTLL_RELOAD_CAPTIONS") return undefined;
-    return reloadCaptionsForCurrentVideo();
+  browser.runtime.onMessage.addListener(async message => {
+    if (message?.type === "YTLL_RELOAD_CAPTIONS") {
+      return reloadCaptionsForCurrentVideo();
+    }
+    if (message?.type === "YTLL_VIDEO_CACHE_CLEARED") {
+      videoCacheSuppressed = true;
+      videoCacheGeneration += 1;
+      await videoCacheSavePromise;
+      if (currentVideoId) {
+        const deleted = await browser.runtime.sendMessage({
+          type: "YTLL_VIDEO_CACHE_DELETE",
+          videoId: currentVideoId,
+          sourceLang: settings.sourceLang,
+          targetLang: settings.targetLang
+        });
+        if (!deleted?.ok) throw new Error(deleted?.reason || "Could not delete the active video cache.");
+      }
+      videoCacheSource = "none";
+      videoCacheSavedAt = null;
+      updateHud();
+      return { ok: true };
+    }
+    if (message?.type !== "YTLL_GET_VIDEO_STATUS") return undefined;
+
+    const videoId = message.videoId || getVideoIdFromUrl();
+    if (!videoId) {
+      return {
+        ok: true,
+        videoId: "",
+        stored: false,
+        usingSrt: false,
+        cacheSource: "none",
+        savedAt: null,
+        cueCount: 0,
+        translatedCount: 0
+      };
+    }
+
+    const sameVideo = videoId === currentVideoId;
+    const sourceLang = message.sourceLang || settings.sourceLang;
+    const targetLang = message.targetLang || settings.targetLang;
+    const cache = await browser.runtime.sendMessage({
+      type: "YTLL_VIDEO_CACHE_GET",
+      videoId,
+      sourceLang,
+      targetLang
+    });
+    if (!cache?.ok) return { ok: false, reason: cache?.reason || "Could not read video cache status." };
+
+    const usingManualSrt = sameVideo && usingSrt;
+    const statusCues = sameVideo ? cues : (cache.found && Array.isArray(cache.cues) ? cache.cues : []);
+    const stored = Boolean(cache.found);
+    return {
+      ok: true,
+      videoId,
+      stored,
+      usingSrt: usingManualSrt,
+      cacheSource: sameVideo ? videoCacheSource : (stored ? "cache" : "none"),
+      savedAt: cache.updatedAt || (sameVideo ? videoCacheSavedAt : null),
+      cueCount: statusCues.length,
+      translatedCount: statusCues.filter(cue =>
+        typeof cue.targetText === "string" && cue.targetText.trim()
+      ).length
+    };
   });
 
   browser.storage.onChanged.addListener((changes, area) => {
