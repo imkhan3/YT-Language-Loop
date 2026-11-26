@@ -182,8 +182,7 @@
       const reason = result.reason || "";
       const retryable =
         reason === "Audio track API unavailable" ||
-        reason === "Audio tracks are not available yet" ||
-        reason.startsWith("No audio track found");
+        reason === "Audio tracks are not available yet";
       if (
         result.ok ||
         !retryable ||
