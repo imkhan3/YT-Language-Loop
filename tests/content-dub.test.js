@@ -15,10 +15,52 @@ function createHarness(decodedAudio = null) {
   });
   let runtimeHandler = async () => ({ ok: true });
   let decoderRate;
+  const audios = [];
+  let time = 0;
+  const videoListeners = new Map();
   const video = {
-    currentTime: 0, paused: true, muted: false, playbackRate: 1,
-    addEventListener() {}, removeEventListener() {}
+    paused: true, muted: false, playbackRate: 1, volume: 1,
+    pauseCount: 0, playCount: 0, seekWasPaused: null,
+    get currentTime() { return time; },
+    set currentTime(value) {
+      time = value;
+      this.seekWasPaused = this.paused;
+      const listener = videoListeners.get("seeked");
+      if (listener) queueMicrotask(listener);
+    },
+    addEventListener(type, listener) { videoListeners.set(type, listener); },
+    removeEventListener(type) { videoListeners.delete(type); },
+    pause() { this.pauseCount++; this.paused = true; },
+    play() { this.playCount++; this.paused = false; return Promise.resolve(); }
   };
+  class MockAudio {
+    constructor() {
+      this.listeners = new Map();
+      this.paused = true;
+      this.ended = false;
+      this.readyState = 0;
+      this.currentTime = 0;
+      this.duration = 1;
+      this.src = "";
+      this.currentSrc = "";
+      this.loadCount = 0;
+      this.playCount = 0;
+      audios.push(this);
+    }
+    addEventListener(type, listener) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(listener);
+    }
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+    load() {
+      this.loadCount++;
+      this.currentSrc = this.src;
+      this.readyState = 1;
+      for (const listener of Array.from(this.listeners.get("loadedmetadata") || [])) listener();
+    }
+    play() { this.playCount++; this.paused = false; return Promise.resolve(); }
+    pause() { this.paused = true; }
+  }
   const window = {
     location: { href: "https://www.youtube.com/watch?v=video1" },
     addEventListener(type, listener) { if (type === "message") pageListener = listener; },
@@ -50,8 +92,12 @@ function createHarness(decodedAudio = null) {
       onChanged: { addListener(listener) { storageListener = listener; } }
     }
   };
+  class MockURL extends URL {
+    static createObjectURL() { return "blob:generated"; }
+    static revokeObjectURL() {}
+  }
   const context = {
-    window, browser, URL, console, structuredClone,
+    window, browser, URL: MockURL, console, structuredClone,
     document: {
       readyState: "loading",
       head: { appendChild() {} },
@@ -60,7 +106,7 @@ function createHarness(decodedAudio = null) {
       getElementById() { return null; },
       querySelector() { return video; }
     },
-    Audio: class { pause() {} addEventListener() {} },
+    Audio: MockAudio,
     atob: text => Buffer.from(text, "base64").toString("binary"),
     btoa: text => Buffer.from(text, "binary").toString("base64"),
     Blob,
@@ -80,18 +126,28 @@ function createHarness(decodedAudio = null) {
           videoCacheSuppressed = true;
         },
         setPass(index) { currentPassIdx = index; },
+        addUrl(index, url) {
+          const cue = cues[index];
+          dubAudioUrls.set(makeDubCueKey(cue, index, cueTargetText(cue)), url);
+        },
+        cacheCue(index) {
+          const cue = cues[index];
+          const key = makeDubCueKey(cue, index, cueTargetText(cue));
+          storeDubCueAudio({ key, cueIdx: index, videoId: currentVideoId, generation: dubCacheGeneration }, "", "audio/wav");
+        },
         shouldPrefetchAiDub, shouldUseAiDub, ensureDubPrefetchForCurrentBlock,
         applyPassSettings, runTransition, generateBilingualCuesForDubbing,
-        findBatchSilences, splitBatchAudio,
+        findBatchSilences, splitBatchAudio, findDubCueIndexForTime,
         queue() { return translationQueue; },
         desired() { return Array.from(dubDesiredCueKeys); },
         currentResult() { return currentPassResult; },
-        currentPass() { return currentPassIdx; }
+        currentPass() { return currentPassIdx; },
+        activeCue() { return activeDubCueIdx; }
       };
     })();`);
   vm.runInNewContext(source, context);
   return {
-    hooks: context.testHooks, video, sent,
+    hooks: context.testHooks, video, sent, audios,
     setPageHandler(handler) { pageHandler = handler; },
     setRuntimeHandler(handler) { runtimeHandler = handler; },
     changeTts(value) { storageListener({ ttsSettings: { newValue: value } }, "local"); },
@@ -217,6 +273,191 @@ test("reuses matching applied pass configuration, but invalidates it on settings
   h.changeTts({ dubMode: "off" });
   await h.hooks.applyPassSettings(2);
   assert.equal(h.sent.filter(message => message.action === "APPLY_PASS").length, 3);
+});
+
+test("reuses the source track and custom overlay for both AI dub passes", async () => {
+  const h = createHarness();
+  const cues = [{ start: 2, end: 3, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  h.setPageHandler(async () => ({
+    audioRes: { ok: true, unchanged: true }, subRes: { ok: true },
+    caps: { audioTrackCount: 2, hasTargetAudio: true }
+  }));
+  await h.hooks.applyPassSettings(0);
+  h.video.currentTime = 2.8;
+  h.video.paused = false;
+
+  const transition = h.hooks.runTransition(0, 1, 1.97);
+  assert.equal(h.video.seekWasPaused, true);
+  assert.equal(h.audios[1].src, "blob:first");
+  assert.equal(h.audios[1].loadCount, 1);
+  assert.equal(h.audios[1].playCount, 0);
+  await transition;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.video.pauseCount, 1);
+  assert.equal(h.video.playCount, 1);
+  assert.equal(h.audios[1].playCount, 1);
+  assert.equal(h.audios[0].loadCount, 0);
+  assert.equal(h.hooks.activeCue(), 0);
+  assert.equal(h.video.muted, true);
+  assert.equal(h.sent.filter(message => message.action === "APPLY_PASS").length, 1);
+
+  h.video.currentTime = 2.8;
+  await h.hooks.runTransition(0, 2, 1.97);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.video.seekWasPaused, true);
+  assert.equal(h.video.playCount, 2);
+  assert.equal(h.audios[0].playCount, 1);
+  assert.equal(h.sent.filter(message => message.action === "APPLY_PASS").length, 1);
+});
+
+test("auto dubbing reuses source audio when no native target track exists", async () => {
+  const h = createHarness();
+  const cues = [{ start: 0, end: 1, sourceText: "source", targetText: "target" }];
+  const differentSubtitles = [
+    { ...passes[0], subtitles: "source" },
+    { ...passes[1], subtitles: "target" }
+  ];
+  h.hooks.setup({ playbacks: differentSubtitles, numPlaybacks: 2 },
+    { dubMode: "auto", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  h.setPageHandler(async () => ({
+    audioRes: { ok: true, unchanged: true }, subRes: { ok: true },
+    caps: { audioTrackCount: 2, hasTargetAudio: false }
+  }));
+  await h.hooks.applyPassSettings(0);
+  h.hooks.setPass(1);
+  await h.hooks.applyPassSettings(1);
+  assert.equal(h.sent.filter(message => message.action === "APPLY_PASS").length, 1);
+  assert.equal(h.hooks.shouldUseAiDub(), true);
+  assert.equal(h.video.muted, true);
+});
+
+test("preloads the first cue if its audio arrives while seeking", async () => {
+  const h = createHarness();
+  const cues = [{ start: 2, end: 3, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.setRuntimeHandler(message => message.type === "YTLL_TTS_SYNTHESIZE_BATCH"
+    ? new Promise(() => {}) : Promise.resolve({ ok: true }));
+  await h.hooks.applyPassSettings(0);
+  h.video.currentTime = 2.8;
+  h.video.paused = false;
+  const transition = h.hooks.runTransition(0, 1, 1.97);
+  assert.equal(h.audios[1].loadCount, 0);
+  h.hooks.cacheCue(0);
+  assert.equal(h.audios[1].src, "blob:generated");
+  assert.equal(h.audios[1].loadCount, 1);
+  await transition;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.audios[1].playCount, 1);
+});
+
+test("starts the first cue after an asynchronously resumed video begins playing", async () => {
+  const h = createHarness();
+  const cues = [{ start: 2, end: 3, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  await h.hooks.applyPassSettings(0);
+  h.video.currentTime = 2.8;
+  h.video.paused = false;
+  let resume;
+  h.video.play = () => new Promise(resolve => {
+    resume = () => { h.video.paused = false; resolve(); };
+  });
+  await h.hooks.runTransition(0, 1, 1.97);
+  assert.equal(h.audios[1].playCount, 0);
+  resume();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.audios[1].playCount, 1);
+});
+
+test("does not resume a video that was already paused", async () => {
+  const h = createHarness();
+  const cues = [{ start: 2, end: 3, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  await h.hooks.applyPassSettings(0);
+  await h.hooks.runTransition(0, 1, 1.97);
+  assert.equal(h.video.paused, true);
+  assert.equal(h.video.playCount, 0);
+  assert.equal(h.audios[1].playCount, 0);
+});
+
+test("switches the native track when AI dubbing cannot handle the target pass", async () => {
+  for (const [mode, key, hasTargetAudio] of [
+    ["off", "key", false], ["force", "", false], ["auto", "key", true]
+  ]) {
+    const h = createHarness();
+    const cues = [{ start: 0, end: 1, sourceText: "source", targetText: "target" }];
+    h.hooks.setup({ playbacks: passes }, { dubMode: mode, azureKey: key }, cues);
+    h.setPageHandler(async () => ({
+      audioRes: { ok: true, unchanged: true }, subRes: { ok: true },
+      caps: { audioTrackCount: 2, hasTargetAudio }
+    }));
+    await h.hooks.applyPassSettings(0);
+    h.hooks.setPass(1);
+    await h.hooks.applyPassSettings(1);
+    const requests = h.sent.filter(message => message.action === "APPLY_PASS");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].payload.audioLang, "ar");
+  }
+});
+
+test("restores the target track if AI dubbing is disabled after source-track reuse", async () => {
+  const h = createHarness();
+  const cues = [{ start: 0, end: 1, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  h.setPageHandler(async () => ({
+    audioRes: { ok: true, unchanged: true }, subRes: { ok: true },
+    caps: { audioTrackCount: 2, hasTargetAudio: true }
+  }));
+  await h.hooks.applyPassSettings(0);
+  h.hooks.setPass(1);
+  await h.hooks.applyPassSettings(1);
+  h.changeTts({ dubMode: "force", azureKey: "key", azureVoice: "ar-SA-ZariyahNeural" });
+  h.changeTts({ dubMode: "off", azureKey: "key" });
+  await new Promise(resolve => setImmediate(resolve));
+  const requests = h.sent.filter(message => message.action === "APPLY_PASS");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.audioLang, "ar");
+  assert.equal(h.video.muted, false);
+});
+
+test("does not use a source-track failure to activate auto dub while restoring native audio", async () => {
+  const h = createHarness();
+  const cues = [{ start: 0, end: 1, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:first");
+  h.setPageHandler(async () => ({
+    audioRes: { ok: false, reason: 'No audio track found for "en"' },
+    subRes: { ok: true }, caps: { audioTrackCount: 2, hasTargetAudio: true }
+  }));
+  await h.hooks.applyPassSettings(0);
+  h.hooks.setPass(1);
+  await h.hooks.applyPassSettings(1);
+  let finish;
+  h.setPageHandler(() => new Promise(resolve => { finish = resolve; }));
+  h.changeTts({ dubMode: "auto", azureKey: "key" });
+  assert.equal(h.hooks.shouldUseAiDub(), false);
+  assert.equal(h.video.muted, false);
+  finish({
+    audioRes: { ok: true }, subRes: { ok: true },
+    caps: { audioTrackCount: 2, hasTargetAudio: true }
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.hooks.shouldUseAiDub(), false);
+});
+
+test("recognizes the first cue up to 120ms before its start", () => {
+  const h = createHarness();
+  h.hooks.setup({ playbacks: passes }, {}, [
+    { start: 2, end: 3, sourceText: "source", targetText: "target" }
+  ]);
+  assert.equal(h.hooks.findDubCueIndexForTime(1.879), -1);
+  assert.equal(h.hooks.findDubCueIndexForTime(1.881), 0);
+  assert.equal(h.hooks.findDubCueIndexForTime(3), -1);
 });
 
 test("ignores an in-flight pass result after settings disable the extension", async () => {

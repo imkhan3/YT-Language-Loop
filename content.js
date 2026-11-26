@@ -80,6 +80,7 @@
   let lastKnownCaps = null;
   let lastAppliedPassConfig = null;
   let lastAppliedPassResult = null;
+  let lastPlayerAudio = null;
   let passConfigRevision = 0;
   let passRequestsInFlight = 0;
   let passSettingsRequestId = 0;
@@ -922,12 +923,25 @@
       return false;
     }
     const noNativeTargetAudio = Boolean(passResult) &&
-      (!passResult?.audioRes?.ok || passResult?.caps?.audioTrackCount <= 1);
+      (!passResult?.audioRes?.ok || passResult?.caps?.audioTrackCount <= 1 ||
+        (passResult?.caps && !passResult.caps.hasTargetAudio));
     return ttsSettings.dubMode === "force" || noNativeTargetAudio;
   }
 
   function shouldUseAiDub(passResult = currentPassResult) {
     return isAiDubCandidate(passResult) && Boolean(ttsSettings.azureKey.trim());
+  }
+
+  function willAiDubHandlePass(passIdx, caps) {
+    return Boolean(
+      settings.enabled &&
+      loopActive &&
+      getPassConfig(passIdx).audioMode === "target" &&
+      ttsSettings.dubMode !== "off" &&
+      ttsSettings.azureKey.trim() &&
+      (ttsSettings.dubMode === "force" ||
+        (caps && !(caps.audioTrackCount > 1 && caps.hasTargetAudio)))
+    );
   }
 
   function shouldPrefetchAiDub(passResult = currentPassResult) {
@@ -1322,6 +1336,9 @@
     dubAudioUrls.set(entry.key, url);
     if (entry.key === activeDubCueKey && waitingForDubBuffer) {
       startDubCue(cues[entry.cueIdx], entry.key, getVideoElement());
+    } else if (transitionInProgress && entry.cueIdx === blocks[currentBlockIdx]?.subStartNum - 1 &&
+        getPassConfig(currentPassIdx).audioMode === "target" && shouldPrefetchAiDub()) {
+      preloadNextDubCue(entry.cueIdx - 1);
     } else if (loadedDubCueKey && activeDubCueIdx >= 0) {
       preloadNextDubCue(activeDubCueIdx);
     }
@@ -1511,7 +1528,7 @@
 
   function preloadNextDubCue(fromCueIdx) {
     const lastBlock = blocks[Math.min(currentBlockIdx + 1, blocks.length - 1)];
-    if (!lastBlock || fromCueIdx < 0) return;
+    if (!lastBlock || fromCueIdx < -1) return;
     for (let cueIdx = fromCueIdx + 1; cueIdx < lastBlock.subEndNum; cueIdx++) {
       const cue = cues[cueIdx];
       const text = cueTargetText(cue);
@@ -1708,6 +1725,13 @@
 
   function findDubCueIndexForTime(timeSec) {
     const block = blocks[currentBlockIdx];
+    if (block && activeDubCueIdx < 0) {
+      const firstIdx = block.subStartNum - 1;
+      const firstCue = cues[firstIdx];
+      if (firstCue && timeSec >= firstCue.start - 0.12 && timeSec < firstCue.end) {
+        return firstIdx;
+      }
+    }
     if (block && activeDubPassIdx === currentPassIdx && activeDubCueIdx >= block.subStartNum - 1 &&
         activeDubCueIdx < block.subEndNum) {
       const activeCue = cues[activeDubCueIdx];
@@ -1859,11 +1883,16 @@
 
     const customOverlay = hasCustomOverlaySubs();
     const subMode = cfg.subMode === "both" && !customOverlay ? "target" : cfg.subMode;
+    const subLang = subMode === "source" ? settings.sourceLang : settings.targetLang;
+    const caps = lastKnownCaps?.videoId === currentVideoId ? lastKnownCaps.caps : null;
+    const aiDubAudio = willAiDubHandlePass(passIdx, caps);
     const passConfig = {
       videoId: currentVideoId,
-      audioLang: cfg.audioLang,
-      subMode,
-      subLang: subMode === "source" ? settings.sourceLang : settings.targetLang,
+      audioLang: aiDubAudio && lastAppliedPassConfig?.videoId === currentVideoId
+        ? lastAppliedPassConfig.audioLang
+        : cfg.audioLang,
+      subMode: customOverlay ? "__custom__" : subMode,
+      subLang: customOverlay ? "__custom__" : subLang,
       useCustomSubs: customOverlay
     };
     if (
@@ -1890,8 +1919,8 @@
     try {
       res = await sendToPage("APPLY_PASS", {
         audioLang: passConfig.audioLang,
-        subMode: passConfig.subMode,
-        subLang: passConfig.subLang,
+        subMode,
+        subLang,
         useCustomSubs: passConfig.useCustomSubs,
         targetLang: settings.targetLang,
         sourceLang: settings.sourceLang
@@ -1902,11 +1931,15 @@
 
     if (requestId !== passSettingsRequestId || passIdx !== currentPassIdx) {
       lastAppliedPassConfig = null;
+      if (passConfig.videoId === currentVideoId) lastPlayerAudio = null;
       return res;
     }
     currentPassResult = res;
     if (res?.caps) {
       lastKnownCaps = { videoId: currentVideoId, caps: res.caps };
+      if (res.audioRes) {
+        lastPlayerAudio = { videoId: currentVideoId, audioLang: passConfig.audioLang };
+      }
       const audioReason = res.audioRes?.reason || "";
       const stableAudioResult = res.audioRes?.ok ||
         audioReason === "No alternate audio tracks on this video" ||
@@ -1970,6 +2003,7 @@
         ? videoMutedBeforeDub
         : video.muted
       : false;
+    if (video && !video.paused && seekTarget !== null) video.pause?.();
     stopDubPlayback(false);
 
     try {
@@ -1983,6 +2017,9 @@
 
       if (video) video.muted = true;
       const blk = blocks[currentBlockIdx];
+      if (blk && getPassConfig(currentPassIdx).audioMode === "target" && shouldPrefetchAiDub()) {
+        preloadNextDubCue(blk.subStartNum - 2);
+      }
       const blockEnd = blk ? blk.end : seekTarget + 1;
       const target = seekTarget === null ? null : Math.max(0, seekTarget);
       if (target !== null) {
@@ -2009,7 +2046,18 @@
       updateHud();
       renderCustomSubtitle();
       if (shouldResumeAfterTransition && video?.paused) {
-        video.play().catch(error => {
+        const requestId = passSettingsRequestId;
+        const playPromise = video.play();
+        if (shouldUseAiDub()) syncDubPlayback(video);
+        Promise.resolve(playPromise).then(() => {
+          if (requestId === passSettingsRequestId && getVideoElement() === video &&
+              !video.paused && !startingDubCueKey && !loadedDubCueKey && shouldUseAiDub()) {
+            syncDubPlayback(video);
+          }
+        }).catch(error => {
+          if (requestId === passSettingsRequestId && getVideoElement() === video) {
+            dubAudio.pause?.();
+          }
           showDubFeedback(error.message || "Could not resume video after transition", true);
         });
       }
@@ -2694,6 +2742,7 @@
       lastKnownCaps = null;
       lastAppliedPassConfig = null;
       lastAppliedPassResult = null;
+      lastPlayerAudio = null;
       passConfigRevision++;
       generatedCueAttemptVideoId = "";
       usingSrt = false;
@@ -2738,6 +2787,7 @@
     lastKnownCaps = null;
     lastAppliedPassConfig = null;
     lastAppliedPassResult = null;
+    lastPlayerAudio = null;
     passConfigRevision++;
     generatedCueAttemptVideoId = "";
     lastMissingKeyNotice = "";
@@ -3012,8 +3062,18 @@
       if (ttsSettings.geminiApiKey.trim() && ttsSettings.geminiApiKey !== previousGeminiKey) {
         scheduleTranslationBatches();
       }
+      const caps = lastKnownCaps?.videoId === currentVideoId ? lastKnownCaps.caps : null;
+      const currentConfig = getPassConfig(currentPassIdx);
+      const needsAudioRestore = !changes.settings && settings.enabled && loopActive &&
+        currentConfig.audioMode === "target" &&
+        (lastPlayerAudio?.videoId !== currentVideoId || lastPlayerAudio.audioLang !== currentConfig.audioLang) &&
+        !willAiDubHandlePass(currentPassIdx, caps);
+      if (needsAudioRestore) currentPassResult = null;
       syncDubActivation(currentPassResult);
       updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
+      if (needsAudioRestore) {
+        applyPassSettings(currentPassIdx);
+      }
     }
 
     if (!changes.settings) return;
