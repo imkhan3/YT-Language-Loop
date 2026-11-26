@@ -192,7 +192,11 @@
         cues = segmented;
         captionLoadError = "";
         rebuildBlocksAndSync();
-        scheduleTranslationBatches();
+        if (ttsSettings.geminiApiKey.trim()) {
+          scheduleTranslationBatches();
+        } else if (cues.some(cueNeedsGeneratedTranslation)) {
+          generateBilingualCuesForDubbing(cues);
+        }
         updateHud();
       }
     }
@@ -503,7 +507,7 @@
           return { ok: true, manual: true, generatedSegments: segments.length };
         }
 
-        usingSrt = true;
+        usingSrt = false;
         usingGeneratedSrt = true;
         captionLoadError = "";
         if (preservePassIdx === null) {
@@ -609,7 +613,11 @@
             cues = segmented;
             captionLoadError = "";
             rebuildBlocksAndSync();
-            scheduleTranslationBatches();
+            if (ttsSettings.geminiApiKey.trim()) {
+              scheduleTranslationBatches();
+            } else if (cues.some(cueNeedsGeneratedTranslation)) {
+              generateBilingualCuesForDubbing(cues);
+            }
             updateHud();
             return { ok: true, segments: cues.length };
           }
@@ -1141,6 +1149,7 @@
     const video = getVideoElement();
     const activeCueIdx = video ? findCueIndexForTime(video.currentTime) : -1;
     const entries = [];
+    const cuesNeedingTranslation = [];
     const lookaheadBlocks = blocks.slice(currentBlockIdx, currentBlockIdx + 2);
     for (let blockOffset = 0; blockOffset < lookaheadBlocks.length; blockOffset++) {
       const block = lookaheadBlocks[blockOffset];
@@ -1155,15 +1164,16 @@
       for (let cueIdx = firstCueIdx; cueIdx < block.subEndNum; cueIdx++) {
         const cue = cues[cueIdx];
         if (!cue) continue;
+        if (cueNeedsGeneratedTranslation(cue)) cuesNeedingTranslation.push(cue);
         const text = cueTargetText(cue);
         if (!text) continue;
         entries.push({ cue, cueIdx, text, key: makeDubCueKey(cue, cueIdx, text) });
       }
     }
-    if (entries.some(entry => cueNeedsGeneratedTranslation(entry.cue))) {
+    if (cuesNeedingTranslation.length > 0) {
       dubDesiredCueKeys = new Set();
       dubPrefetchQueue = [];
-      generateBilingualCuesForDubbing(entries.map(entry => entry.cue));
+      generateBilingualCuesForDubbing(cuesNeedingTranslation);
       return;
     }
 
@@ -1418,12 +1428,13 @@
     const cfg = getPassConfig(passIdx);
     if (loopActive) video.playbackRate = cfg.speed;
 
-    const subMode = cfg.subMode === "both" && !usingSrt ? "target" : cfg.subMode;
+    const customOverlay = hasCustomOverlaySubs();
+    const subMode = cfg.subMode === "both" && !customOverlay ? "target" : cfg.subMode;
     const res = await sendToPage("APPLY_PASS", {
       audioLang: cfg.audioLang,
       subMode,
       subLang: subMode === "source" ? settings.sourceLang : settings.targetLang,
-      useCustomSubs: usingSrt,
+      useCustomSubs: customOverlay,
       targetLang: settings.targetLang,
       sourceLang: settings.sourceLang
     });
@@ -1585,6 +1596,10 @@
     renderCustomSubtitle();
   }
 
+  function hasCustomOverlaySubs() {
+    return usingSrt || cues.length > 0;
+  }
+
   function renderCustomSubtitle() {
     if (!hud.subtitleOverlay) return;
 
@@ -1596,7 +1611,7 @@
     targetLine.dir = ["ar", "he", "fa", "ur"].includes(settings.targetLang)
       ? "rtl"
       : "ltr";
-    if (!usingSrt || !settings.enabled || !video || subMode === "off") {
+    if (!hasCustomOverlaySubs() || !settings.enabled || !video || subMode === "off") {
       targetLine.hidden = true;
       sourceLine.hidden = true;
       overlay.hidden = true;
@@ -1933,7 +1948,7 @@
       cfg.subMode === "off"
         ? "Off"
         : cfg.subMode === "both"
-          ? usingSrt
+          ? hasCustomOverlaySubs()
             ? "Both"
             : "Both (load dual-language SRT)"
           : cfg.subLang;
@@ -2310,10 +2325,14 @@
 
     if (changes.ttsSettings) {
       const previousVoice = ttsSettings.azureVoice;
+      const previousGeminiKey = ttsSettings.geminiApiKey;
       ttsSettings = normalizeTtsSettings(changes.ttsSettings.newValue);
       lastMissingKeyNotice = "";
       stopDubPlayback();
       if (previousVoice !== ttsSettings.azureVoice) clearDubAudioUrls();
+      if (ttsSettings.geminiApiKey.trim() && ttsSettings.geminiApiKey !== previousGeminiKey) {
+        scheduleTranslationBatches();
+      }
       syncDubActivation(currentPassResult);
       updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
     }
