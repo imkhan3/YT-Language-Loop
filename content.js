@@ -545,6 +545,7 @@
             currentBlockIdx = findBlockIndexForTime(getVideoElement()?.currentTime || 0);
           }
           currentPassIdx = Math.min(preservePassIdx, (settings.numPlaybacks || 1) - 1);
+          notifyTranscriptUpdated();
           if (settings.enabled && loopActive && blocks.length > 0) {
             await applyPassSettings(currentPassIdx);
           }
@@ -981,6 +982,7 @@
         videoCacheSavedAt = result.savedAt || Date.now();
         if (videoCacheSource === "none") videoCacheSource = "live";
         updateHud();
+        notifyTranscriptUpdated();
       }
     }).catch(error => {
       if (videoId === currentVideoId) {
@@ -1092,6 +1094,7 @@
                   cueList[item.index].targetText = translatedText.trim();
                 }
               }
+              notifyTranscriptUpdated();
             }
           }
         } catch (error) {
@@ -1822,6 +1825,33 @@
     return -1;
   }
 
+  function buildTranscriptPayload() {
+    return {
+      ok: true,
+      videoId: currentVideoId,
+      sourceLang: settings.sourceLang,
+      targetLang: settings.targetLang,
+      subtitlesPerLoop: settings.subtitlesPerLoop || 5,
+      currentBlockIdx,
+      activeCueIdx: findCueIndexForTime(getVideoElement()?.currentTime ?? -1),
+      translatedCount: cues.filter(cue =>
+        typeof cue.targetText === "string" && cue.targetText.trim()
+      ).length,
+      cues: cues.map((cue, index) => ({
+        index,
+        start: cue.start,
+        end: cue.end,
+        sourceText: cue.sourceText || "",
+        targetText: cue.targetText || ""
+      }))
+    };
+  }
+
+  function notifyTranscriptUpdated() {
+    browser.runtime.sendMessage({ type: "YTLL_TRANSCRIPT_UPDATED", ...buildTranscriptPayload() })
+      .catch(() => {});
+  }
+
   function rebuildBlocksAndSync() {
     stopDubPlayback();
     clearDubAudioUrls();
@@ -1833,6 +1863,7 @@
     const curTime = video ? video.currentTime : 0;
     currentBlockIdx = findBlockIndexForTime(curTime);
     currentPassIdx = 0;
+    notifyTranscriptUpdated();
     if (settings.enabled && loopActive && blocks.length > 0) {
       applyPassSettings(0);
     }
@@ -2444,6 +2475,8 @@
       lastProgrammaticSeekTo = null;
       cues = [];
       blocks = [];
+      currentBlockIdx = 0;
+      notifyTranscriptUpdated();
       renderCustomSubtitle();
       if (hud.root) hud.root.classList.add("ytll-hidden");
       return;
@@ -2486,6 +2519,7 @@
     blocks = [];
     currentBlockIdx = 0;
     currentPassIdx = 0;
+    notifyTranscriptUpdated();
 
     ensureHudMounted();
     attachVideoListeners();
@@ -2633,11 +2667,34 @@
     videoCacheSavedAt = null;
     videoMetadata = { title: "", channel: "" };
     captionLoadError = "";
+    notifyTranscriptUpdated();
     updateHud();
     return fetchSingleLanguageCaptions(videoId, requestId);
   }
 
   browser.runtime.onMessage.addListener(async message => {
+    if (message?.type === "YTLL_GET_TRANSCRIPT") {
+      if (!getVideoIdFromUrl()) {
+        return {
+          ...buildTranscriptPayload(),
+          videoId: "",
+          currentBlockIdx: 0,
+          activeCueIdx: -1,
+          translatedCount: 0,
+          cues: []
+        };
+      }
+      return buildTranscriptPayload();
+    }
+    if (message?.type === "YTLL_SEEK_TO_TIME") {
+      if (!Number.isFinite(message.time) || blocks.length === 0) {
+        return { ok: false, reason: "A valid time and loaded subtitles are required." };
+      }
+      const blockIdx = findBlockIndexForTime(message.time);
+      runTransition(blockIdx, 0, message.time);
+      scheduleTranslationBatches();
+      return { ok: true };
+    }
     if (message?.type === "YTLL_RELOAD_CAPTIONS") {
       return reloadCaptionsForCurrentVideo();
     }
@@ -2656,6 +2713,7 @@
       }
       videoCacheSource = "none";
       videoCacheSavedAt = null;
+      notifyTranscriptUpdated();
       updateHud();
       return { ok: true };
     }
@@ -2745,6 +2803,7 @@
         setDubMuteActive(false, video);
         waitingForDubEnd = false;
         if (video) video.playbackRate = 1.0;
+        notifyTranscriptUpdated();
       }
       if (settings.enabled) initForCurrentVideo();
       updateHud();
@@ -2755,6 +2814,7 @@
       setDubMuteActive(false, video);
       waitingForDubEnd = false;
       if (video) video.playbackRate = 1.0;
+      notifyTranscriptUpdated();
       updateHud();
       return;
     }
@@ -2787,6 +2847,7 @@
       if (loopActive) applyPassSettings(currentPassIdx);
       else updateHud();
     }
+    if (languagesChanged && usingSrt) notifyTranscriptUpdated();
   });
 
   // Start once DOM is ready

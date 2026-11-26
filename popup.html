@@ -71,7 +71,7 @@
         </div>
         <div class="field">
           <label for="geminiModel">Gemini Model</label>
-          <input type="text" id="geminiModel" placeholder="gemini-2.5-flash" autocomplete="off" />
+          <input type="text" id="geminiModel" placeholder="gemini-3.1-flash-lite" autocomplete="off" />
         </div>
         <div class="tts-actions">
           <button type="button" id="testGeminiBtn" class="btn-secondary">Test Gemini</button>
@@ -109,6 +109,13 @@
         <div class="tts-actions">
           <button type="button" id="testVoiceBtn" class="btn-secondary">Test Voice</button>
           <button type="button" id="clearTtsCacheBtn" class="btn-secondary">Clear Audio Cache</button>
+        </div>
+      </details>
+
+      <details id="transcriptCard" class="card transcript-card">
+        <summary>Transcript <span id="transcriptProgress" class="transcript-progress">0/0</span></summary>
+        <div id="transcriptList" class="transcript-list">
+          <p class="transcript-empty">Open a YouTube video to view the transcript.</p>
         </div>
       </details>
     </main>

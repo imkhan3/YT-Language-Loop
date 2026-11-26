@@ -25,7 +25,7 @@ async function getTranslationSettings() {
     geminiApiKey: typeof settings.geminiApiKey === "string" ? settings.geminiApiKey : "",
     geminiModel: typeof settings.geminiModel === "string" && settings.geminiModel.trim()
       ? settings.geminiModel.trim()
-      : "gemini-2.5-flash"
+      : "gemini-3.1-flash-lite"
   };
 }
 

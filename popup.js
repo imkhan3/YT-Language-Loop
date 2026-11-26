@@ -29,7 +29,7 @@ const DEFAULT_SETTINGS = {
 const DEFAULT_TTS_SETTINGS = {
   dubMode: "auto",
   geminiApiKey: "",
-  geminiModel: "gemini-2.5-flash",
+  geminiModel: "gemini-3.1-flash-lite",
   azureKey: "",
   azureRegion: "eastus",
   azureVoice: "ar-SA-HamedNeural",
@@ -42,6 +42,17 @@ let ttsSettings = { ...DEFAULT_TTS_SETTINGS };
 let playbackCache = structuredClone(DEFAULT_SETTINGS.playbacks);
 let statusTimer = null;
 let testAudio = null;
+let activeTabId = null;
+let transcriptPollTimer = null;
+let transcriptRequestVersion = 0;
+let transcriptAppliedVersion = 0;
+let transcriptVideoId = "";
+let transcriptCues = [];
+let transcriptItems = [];
+let transcriptActiveCueIdx = -1;
+let lastTranscriptInteraction = 0;
+let scrollToActiveOnNextTranscript = false;
+let videoCacheStatusRequest = 0;
 
 const els = {
   enabled: document.getElementById("enabled"),
@@ -55,6 +66,9 @@ const els = {
   reloadCaptionsBtn: document.getElementById("reloadCaptionsBtn"),
   status: document.getElementById("status"),
   videoCacheStatus: document.getElementById("videoCacheStatus"),
+  transcriptCard: document.getElementById("transcriptCard"),
+  transcriptProgress: document.getElementById("transcriptProgress"),
+  transcriptList: document.getElementById("transcriptList"),
   dubMode: document.getElementById("dubMode"),
   geminiApiKey: document.getElementById("geminiApiKey"),
   geminiModel: document.getElementById("geminiModel"),
@@ -241,10 +255,134 @@ function formatCacheAge(savedAt) {
   return `saved ${Math.floor(ageHours / 24)}d ago`;
 }
 
+function formatTranscriptTime(time) {
+  const seconds = Math.max(0, Math.floor(time));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function showTranscriptEmpty(message) {
+  transcriptVideoId = "";
+  transcriptCues = [];
+  transcriptItems = [];
+  transcriptActiveCueIdx = -1;
+  els.transcriptProgress.textContent = "0/0 translated";
+  const empty = document.createElement("p");
+  empty.className = "transcript-empty";
+  empty.textContent = message;
+  els.transcriptList.replaceChildren(empty);
+}
+
+async function seekToTranscriptCue(index) {
+  const cue = transcriptCues[index];
+  if (!cue || activeTabId === null) return;
+  try {
+    const result = await browser.tabs.sendMessage(activeTabId, {
+      type: "YTLL_SEEK_TO_TIME",
+      time: cue.start
+    });
+    if (!result?.ok) throw new Error(result?.reason || "Could not seek to this subtitle.");
+    await refreshTranscript();
+  } catch (error) {
+    console.error("Failed to seek to transcript cue:", error);
+    showStatus(`Seek failed: ${error.message}`, true);
+  }
+}
+
+function renderTranscript(payload) {
+  if (!payload.videoId) {
+    showTranscriptEmpty("Open a YouTube video to view the transcript.");
+    return;
+  }
+
+  const cues = payload.cues;
+  els.transcriptProgress.textContent = `${payload.translatedCount}/${cues.length} translated`;
+  if (cues.length === 0) {
+    showTranscriptEmpty("No captions loaded for this video.");
+    return;
+  }
+
+  if (transcriptVideoId !== payload.videoId || transcriptItems.length !== cues.length) {
+    transcriptItems = cues.map((cue, index) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "transcript-item";
+      const meta = document.createElement("div");
+      meta.className = "transcript-meta";
+      const source = document.createElement("div");
+      source.className = "transcript-source";
+      const target = document.createElement("div");
+      target.className = "transcript-target";
+      item.append(meta, source, target);
+      item.addEventListener("click", () => seekToTranscriptCue(index));
+      return { item, meta, source, target };
+    });
+    els.transcriptList.replaceChildren(...transcriptItems.map(entry => entry.item));
+  }
+
+  const activeChanged = transcriptVideoId !== payload.videoId ||
+    transcriptActiveCueIdx !== payload.activeCueIdx;
+  transcriptVideoId = payload.videoId;
+  transcriptCues = cues;
+  transcriptActiveCueIdx = payload.activeCueIdx;
+  const rtl = /^(ar|he|fa|ur)(-|$)/i.test(payload.targetLang);
+  const blockSize = payload.subtitlesPerLoop || 5;
+
+  cues.forEach((cue, index) => {
+    const { item, meta, source, target } = transcriptItems[index];
+    const metaText = `${formatTranscriptTime(cue.start)} · #${cue.index + 1}`;
+    const sourceText = cue.sourceText || "";
+    const targetText = cue.targetText?.trim() ? cue.targetText : "Pending";
+    if (meta.textContent !== metaText) meta.textContent = metaText;
+    if (source.textContent !== sourceText) source.textContent = sourceText;
+    if (target.textContent !== targetText) target.textContent = targetText;
+    target.dir = rtl ? "rtl" : "auto";
+    target.classList.toggle("pending", !cue.targetText?.trim());
+    item.classList.toggle("block-start", index % blockSize === 0);
+    item.classList.toggle("active", cue.index === payload.activeCueIdx);
+  });
+
+  if (
+    els.transcriptCard.open &&
+    (scrollToActiveOnNextTranscript || (activeChanged && Date.now() - lastTranscriptInteraction > 1200))
+  ) {
+    const active = transcriptItems.find((entry, index) => cues[index].index === payload.activeCueIdx);
+    active?.item.scrollIntoView({ block: "nearest" });
+    scrollToActiveOnNextTranscript = false;
+  }
+}
+
+async function refreshTranscript() {
+  const requestVersion = ++transcriptRequestVersion;
+  if (activeTabId === null) {
+    transcriptAppliedVersion = requestVersion;
+    showTranscriptEmpty("Open a YouTube video to view the transcript.");
+    return;
+  }
+  try {
+    const payload = await browser.tabs.sendMessage(activeTabId, { type: "YTLL_GET_TRANSCRIPT" });
+    if (requestVersion < transcriptAppliedVersion) return;
+    transcriptAppliedVersion = requestVersion;
+    if (!payload?.ok || !Array.isArray(payload.cues)) {
+      const reason = payload?.reason || "Could not read the transcript.";
+      console.error("Invalid transcript response:", reason);
+      showTranscriptEmpty(reason);
+      return;
+    }
+    renderTranscript(payload);
+  } catch (error) {
+    if (requestVersion < transcriptAppliedVersion) return;
+    transcriptAppliedVersion = requestVersion;
+    console.warn("Could not load transcript:", error);
+    showTranscriptEmpty("Open a YouTube video to view the transcript.");
+  }
+}
+
 async function refreshVideoCacheStatus() {
+  const request = ++videoCacheStatusRequest;
   els.videoCacheStatus.textContent = "Video cache: Checking…";
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (request !== videoCacheStatusRequest) return;
     if (!tab || typeof tab.id !== "number") {
       els.videoCacheStatus.textContent = "Video cache: No active tab";
       return;
@@ -254,6 +392,7 @@ async function refreshVideoCacheStatus() {
       sourceLang: state.sourceLang,
       targetLang: state.targetLang
     });
+    if (request !== videoCacheStatusRequest) return;
     if (!result?.ok) {
       throw new Error(result?.reason || "Could not read video cache status.");
     }
@@ -269,6 +408,7 @@ async function refreshVideoCacheStatus() {
     els.videoCacheStatus.textContent =
       `Video cache: Stored (${result.translatedCount}/${result.cueCount} cues translated${age ? `, ${age}` : ""})`;
   } catch (err) {
+    if (request !== videoCacheStatusRequest) return;
     console.error("Failed to load video cache status:", err);
     els.videoCacheStatus.textContent = "Video cache: Status unavailable";
   }
@@ -520,6 +660,35 @@ function syncFormFromState() {
 }
 
 function bindEvents() {
+  els.transcriptCard.addEventListener("toggle", () => {
+    if (els.transcriptCard.open) {
+      scrollToActiveOnNextTranscript = true;
+      refreshTranscript();
+      if (transcriptPollTimer === null) {
+        transcriptPollTimer = setInterval(refreshTranscript, 1000);
+      }
+    } else {
+      clearInterval(transcriptPollTimer);
+      transcriptPollTimer = null;
+    }
+  });
+  for (const event of ["wheel", "touchstart", "pointerdown", "keydown"]) {
+    els.transcriptList.addEventListener(event, () => {
+      lastTranscriptInteraction = Date.now();
+    }, { passive: true });
+  }
+  window.addEventListener("unload", () => clearInterval(transcriptPollTimer));
+  browser.runtime.onMessage.addListener((message, sender) => {
+    if (message?.type !== "YTLL_TRANSCRIPT_UPDATED" || sender.tab?.id !== activeTabId) return;
+    if (!message.ok || !Array.isArray(message.cues)) {
+      console.error("Invalid transcript update received.");
+      return;
+    }
+    transcriptAppliedVersion = ++transcriptRequestVersion;
+    renderTranscript(message);
+    refreshVideoCacheStatus();
+  });
+
   els.enabled.addEventListener("change", () => {
     state.enabled = els.enabled.checked;
     els.main.classList.toggle("disabled", !state.enabled);
@@ -632,6 +801,13 @@ async function init() {
   bindEvents();
   syncFormFromState();
   syncTtsFormFromSettings();
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    activeTabId = typeof tab?.id === "number" ? tab.id : null;
+  } catch (error) {
+    console.error("Failed to identify active tab:", error);
+  }
+  await refreshTranscript();
   await refreshVideoCacheStatus();
 }
 
