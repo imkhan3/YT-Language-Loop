@@ -28,6 +28,7 @@
   let currentVideoId = "";
   let cues = [];
   let blocks = [];
+  let videoMetadata = { title: "", channel: "" };
   let currentBlockIdx = 0;
   let currentPassIdx = 0;
   let loopActive = true;
@@ -168,9 +169,21 @@
       (matchesLanguageCode(payload.lang, settings.targetLang) ||
         matchesLanguageCode(payload.lang, settings.sourceLang))
     ) {
-      const parsed = parseSubtitles(payload.raw);
-      if (parsed.length > 0) {
-        cues = parsed;
+      let segmented = [];
+      try {
+        const json = JSON.parse(payload.raw);
+        if (Array.isArray(json.events)) segmented = segmentRawEvents(json.events);
+      } catch (_) {}
+      if (segmented.length === 0) {
+        segmented = parseSubtitles(payload.raw).map(cue => ({
+          start: cue.start,
+          end: cue.end,
+          sourceText: cue.text,
+          targetText: ""
+        }));
+      }
+      if (segmented.length > 0) {
+        cues = segmented;
         captionLoadError = "";
         rebuildBlocksAndSync();
         updateHud();
@@ -239,6 +252,125 @@
       }
     }
     return list;
+  }
+
+  function cleanCaptionText(text) {
+    if (typeof text !== "string") return "";
+    const cleaned = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+    if (!cleaned) return "";
+    if (/^(?:\[|\(|♪).*(?:\]|\)|♪)$/.test(cleaned)) return "";
+    if (/^(?:\[[^\]]+\]|[\u266A].*[\u266A])$/.test(cleaned)) return "";
+    return cleaned;
+  }
+
+  function segmentRawEvents(events) {
+    if (!Array.isArray(events)) return [];
+
+    const fragments = [];
+    for (const ev of events) {
+      if (!ev?.segs || typeof ev.tStartMs !== "number") continue;
+      const text = cleanCaptionText(ev.segs.map(seg => seg?.utf8 || "").join(""));
+      if (!text) continue;
+      const start = ev.tStartMs / 1000;
+      const end = start + ((ev.dDurationMs || 2000) / 1000);
+      fragments.push({ start, end: Math.max(end, start + 0.1), text });
+    }
+
+    const segments = [];
+    let current = [];
+    const flush = () => {
+      if (current.length === 0) return;
+      const sourceText = current.map(fragment => fragment.text).join(" ").replace(/\s+/g, " ").trim();
+      if (sourceText) {
+        segments.push({
+          start: current[0].start,
+          end: current[current.length - 1].end,
+          sourceText,
+          targetText: ""
+        });
+      }
+      current = [];
+    };
+
+    const splitAtIndex = (fragmentIndex) => {
+      const cut = Math.max(1, Math.min(fragmentIndex, current.length));
+      const before = current.slice(0, cut);
+      const after = current.slice(cut);
+      if (before.length > 0) {
+        current = before;
+        flush();
+      }
+      current = after;
+    };
+
+    for (const fragment of fragments) {
+      if (current.length > 0) {
+        const previousEnd = current[current.length - 1].end;
+        if (fragment.start - previousEnd > 1.5) flush();
+      }
+      current.push(fragment);
+
+      const sourceText = current.map(item => item.text).join(" ");
+      const duration = current[current.length - 1].end - current[0].start;
+      const wordCount = sourceText.split(/\s+/).filter(Boolean).length;
+      const endsInSentence = /[.!?。！？۔؟]$/.test(sourceText.trim());
+
+      if (endsInSentence) {
+        flush();
+        continue;
+      }
+
+      if (duration > 13 || wordCount > 20) {
+        if (duration <= 13 && wordCount <= 20) continue;
+
+        let cutIndex = -1;
+        for (let i = 0; i < current.length; i++) {
+          if (/[,;，；、]$/.test(current[i].text.trim()) && i < current.length - 1) {
+            cutIndex = i + 1;
+          }
+        }
+
+        if (cutIndex < 0) {
+          let largestGap = -1;
+          for (let i = 1; i < current.length; i++) {
+            const gap = current[i].start - current[i - 1].end;
+            if (gap > largestGap) {
+              largestGap = gap;
+              cutIndex = i;
+            }
+          }
+        }
+
+        if (cutIndex > 0) splitAtIndex(cutIndex);
+        else flush();
+        continue;
+      }
+
+      if (duration >= 8) {
+        let cutIndex = -1;
+        for (let i = 0; i < current.length; i++) {
+          if (/[,;，；、]$/.test(current[i].text.trim()) && i < current.length - 1) {
+            cutIndex = i + 1;
+          }
+        }
+        if (cutIndex < 0) {
+          let largestGap = 0;
+          let largestGapIndex = -1;
+          for (let i = 1; i < current.length; i++) {
+            const gap = current[i].start - current[i - 1].end;
+            if (gap > largestGap) {
+              largestGap = gap;
+              largestGapIndex = i;
+            }
+          }
+          if (largestGap > 0.35) cutIndex = largestGapIndex;
+        }
+        if (cutIndex > 0) splitAtIndex(cutIndex);
+      }
+    }
+    flush();
+
+    return normalizeCues(segments);
   }
 
   function parseSrtTimestamp(value) {
@@ -363,14 +495,30 @@
         usingSrt = true;
         usingGeneratedSrt = true;
         captionLoadError = "";
-        cues = segments;
         if (preservePassIdx === null) {
+          cues = segments;
           rebuildBlocksAndSync();
         } else {
           stopDubPlayback();
           clearDubAudioUrls();
-          blocks = buildBlocks(cues, settings.subtitlesPerLoop || 5);
-          currentBlockIdx = findBlockIndexForTime(getVideoElement()?.currentTime || 0);
+          if (cues.length > 0) {
+            for (const cue of cues) {
+              const midpoint = (cue.start + cue.end) / 2;
+              const overlapMatches = segments.filter(segment => {
+                const overlap = Math.min(cue.end, segment.end) - Math.max(cue.start, segment.start);
+                return overlap > 0 || (midpoint >= segment.start && midpoint < segment.end);
+              });
+              cue.targetText = overlapMatches
+                .map(segment => segment.targetText)
+                .filter(Boolean)
+                .join("\n")
+                .trim();
+            }
+          } else {
+            cues = segments;
+            blocks = buildBlocks(cues, settings.subtitlesPerLoop || 5);
+            currentBlockIdx = findBlockIndexForTime(getVideoElement()?.currentTime || 0);
+          }
           currentPassIdx = Math.min(preservePassIdx, (settings.numPlaybacks || 1) - 1);
           if (settings.enabled && loopActive && blocks.length > 0) {
             await applyPassSettings(currentPassIdx);
@@ -412,6 +560,8 @@
   async function fetchSingleLanguageCaptions(videoId, requestId, maxAttempts = 8) {
     const languages = [...new Set([settings.targetLang, settings.sourceLang].filter(Boolean))];
     let reason = `No "${settings.targetLang}" or "${settings.sourceLang}" captions found`;
+    const sourceFirstLanguages = [settings.sourceLang, settings.targetLang].filter(Boolean);
+    const orderedLanguages = [...new Set([...sourceFirstLanguages, ...languages])];
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (requestId !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) {
@@ -420,8 +570,8 @@
       if (usingSrt) return { ok: true, manual: true, segments: cues.length };
       if (cues.length > 0) return { ok: true, segments: cues.length };
 
-      for (const langCode of languages) {
-        const result = await sendToPage("FETCH_SUBTITLES", { langCode });
+      for (const langCode of orderedLanguages) {
+        const result = await sendToPage("FETCH_SOURCE_EVENTS", { langCode });
         if (requestId !== captionGenerationRequest || getVideoIdFromUrl() !== videoId) {
           return { ok: false, canceled: true };
         }
@@ -429,9 +579,23 @@
         if (cues.length > 0) return { ok: true, segments: cues.length };
 
         if (result?.ok && result.raw) {
-          const parsed = parseSubtitles(result.raw);
-          if (parsed.length > 0) {
-            cues = parsed;
+          videoMetadata = {
+            title: typeof result.metadata?.title === "string" ? result.metadata.title : "",
+            channel: typeof result.metadata?.channel === "string" ? result.metadata.channel : ""
+          };
+          const segmented = Array.isArray(result.events) && result.events.length > 0
+            ? segmentRawEvents(result.events)
+            : (() => {
+              const parsed = parseSubtitles(result.raw);
+              return parsed.map(cue => ({
+                start: cue.start,
+                end: cue.end,
+                sourceText: cue.text,
+                targetText: ""
+              }));
+            })();
+          if (segmented.length > 0) {
+            cues = segmented;
             captionLoadError = "";
             rebuildBlocksAndSync();
             updateHud();

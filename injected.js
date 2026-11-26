@@ -258,6 +258,33 @@
     return tracks;
   }
 
+  function getVideoMetadata() {
+    const player = getPlayer();
+    let details = null;
+    try {
+      details = player?.getPlayerResponse?.()?.videoDetails ||
+        window.ytInitialPlayerResponse?.videoDetails ||
+        null;
+    } catch (_) {}
+
+    return {
+      title: typeof details?.title === "string" ? details.title : "",
+      channel: typeof details?.author === "string"
+        ? details.author
+        : (typeof details?.channelTitle === "string" ? details.channelTitle : "")
+    };
+  }
+
+  function extractJson3Events(raw) {
+    if (typeof raw !== "string") return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed.events) ? parsed.events : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
   async function fetchSubtitlesForLang(langCode) {
     const videoId = getVideoId();
     if (!videoId) return { ok: false, reason: "No video ID" };
@@ -265,7 +292,14 @@
     // 1. Check cache first
     for (const [key, raw] of timedtextCache.entries()) {
       if (key.startsWith(`${videoId}:`) && matchesLang(key.split(":")[1], langCode)) {
-        return { ok: true, raw, videoId, lang: langCode };
+        return {
+          ok: true,
+          raw,
+          events: extractJson3Events(raw),
+          metadata: getVideoMetadata(),
+          videoId,
+          lang: langCode
+        };
       }
     }
 
@@ -291,7 +325,14 @@
           const text = await res.text();
           if (text && text.trim().length > 0) {
             timedtextCache.set(`${videoId}:${langCode.toLowerCase()}`, text);
-            return { ok: true, raw: text, videoId, lang: langCode };
+            return {
+              ok: true,
+              raw: text,
+              events: extractJson3Events(text),
+              metadata: getVideoMetadata(),
+              videoId,
+              lang: langCode
+            };
           }
         }
       } catch (_) {}
@@ -305,7 +346,14 @@
         await new Promise((r) => setTimeout(r, 200));
         for (const [key, raw] of timedtextCache.entries()) {
           if (key.startsWith(`${videoId}:`) && matchesLang(key.split(":")[1], langCode)) {
-            return { ok: true, raw, videoId, lang: langCode };
+            return {
+              ok: true,
+              raw,
+              events: extractJson3Events(raw),
+              metadata: getVideoMetadata(),
+              videoId,
+              lang: langCode
+            };
           }
         }
       }
@@ -461,7 +509,7 @@ function formatSrtTime(ms) {
     const { id, action, payload } = event.data;
     let result = null;
 
-    if (action === "FETCH_SUBTITLES") {
+    if (action === "FETCH_SOURCE_EVENTS" || action === "FETCH_SUBTITLES") {
       result = await fetchSubtitlesForLang(payload.langCode);
     } else if (action === "GENERATE_BILINGUAL_SRT") {
       try {
