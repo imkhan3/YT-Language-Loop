@@ -1,5 +1,119 @@
 const TTS_TEST_PHRASE = "مرحباً بكم، هذا اختبار للصوت العربي الفصيح.";
 const inFlight = new Map();
+const translationInFlight = new Map();
+
+async function createTranslationCacheKey(text, sourceLang, targetLang, model) {
+  const normalized = normalizeText(text);
+  const identity = `${sourceLang.trim().toLowerCase()}::${targetLang.trim().toLowerCase()}::${model.trim()}::${normalized}`;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+  const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+  return `gemini::${hash}`;
+}
+
+async function getTranslationSettings() {
+  const stored = await browser.storage.local.get("ttsSettings");
+  const settings = stored.ttsSettings || {};
+  return {
+    geminiApiKey: typeof settings.geminiApiKey === "string" ? settings.geminiApiKey : "",
+    geminiModel: typeof settings.geminiModel === "string" && settings.geminiModel.trim()
+      ? settings.geminiModel.trim()
+      : "gemini-2.5-flash"
+  };
+}
+
+function validateGeminiSettings(apiKey, model) {
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    throw new Error("Enter a Gemini API key.");
+  }
+  if (typeof model !== "string" || !/^[A-Za-z0-9._-]+$/.test(model.trim())) {
+    throw new Error("Enter a valid Gemini model name.");
+  }
+}
+
+function extractGeminiText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    const text = parts.map(part => typeof part?.text === "string" ? part.text : "").join("").trim();
+    if (text) return text;
+  }
+  throw new Error("Gemini returned no translated text.");
+}
+
+async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, model) {
+  validateGeminiSettings(apiKey, model);
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("Translation text must not be empty.");
+  }
+  if (typeof sourceLang !== "string" || !sourceLang.trim() ||
+      typeof targetLang !== "string" || !targetLang.trim()) {
+    throw new Error("A source and target language are required.");
+  }
+
+  const prompt =
+    `Translate the following text from ${sourceLang.trim()} to ${targetLang.trim()}.\n` +
+    "Use natural Modern Standard Arabic where appropriate. Return only the translation, with no notes or quotations.\n\n" +
+    text.trim();
+
+  const modelName = encodeURIComponent(model.trim());
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 2048
+        }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const details = (await response.text()).trim().slice(0, 300);
+    throw new Error(`Gemini returned HTTP ${response.status}${details ? `: ${details}` : ""}`);
+  }
+  return extractGeminiText(await response.json());
+}
+
+async function translateCached(text, sourceLang, targetLang, forceRefresh) {
+  const settings = await getTranslationSettings();
+  const model = settings.geminiModel;
+  validateGeminiSettings(settings.geminiApiKey, model);
+  const key = await createTranslationCacheKey(text, sourceLang, targetLang, model);
+
+  if (!forceRefresh) {
+    const cached = await YTLLTranslationCache.get(key);
+    if (cached?.translatedText) {
+      return { ok: true, translatedText: cached.translatedText, cached: true };
+    }
+  }
+
+  if (translationInFlight.has(key)) {
+    const translatedText = await translationInFlight.get(key);
+    return { ok: true, translatedText, cached: false };
+  }
+
+  const translation = (async () => {
+    const translatedText = await requestGeminiTranslation(
+      text,
+      sourceLang,
+      targetLang,
+      settings.geminiApiKey,
+      model
+    );
+    await YTLLTranslationCache.put({ key, translatedText, createdAt: Date.now() });
+    return translatedText;
+  })();
+  translationInFlight.set(key, translation);
+  try {
+    const translatedText = await translation;
+    return { ok: true, translatedText, cached: false };
+  } finally {
+    translationInFlight.delete(key);
+  }
+}
 
 function normalizeText(text) {
   return text.normalize("NFKC").replace(/\s+/g, " ").trim();
@@ -156,6 +270,48 @@ browser.runtime.onMessage.addListener(async message => {
     }
     if (message.type === "YTLL_TTS_CLEAR_CACHE") {
       await YTLLTTSCache.clear();
+      return { ok: true };
+    }
+    if (
+      message.type === "YTLL_TRANSLATE" ||
+      message.type === "YTLL_TRANSLATE_TEXT" ||
+      message.type === "YTLL_GEMINI_TRANSLATE"
+    ) {
+      return await translateCached(
+        message.text,
+        message.sourceLang || "en",
+        message.targetLang || "ar",
+        message.forceRefresh === true
+      );
+    }
+    if (
+      message.type === "YTLL_TRANSLATION_TEST" ||
+      message.type === "YTLL_GEMINI_TEST"
+    ) {
+      const apiKey = typeof message.geminiApiKey === "string"
+        ? message.geminiApiKey
+        : (await getTranslationSettings()).geminiApiKey;
+      const model = typeof message.geminiModel === "string"
+        ? message.geminiModel
+        : (await getTranslationSettings()).geminiModel;
+      const translatedText = await requestGeminiTranslation(
+        "Hello, this is a translation test.",
+        "English",
+        "Arabic",
+        apiKey,
+        model
+      );
+      return { ok: true, translatedText };
+    }
+    if (
+      message.type === "YTLL_TRANSLATION_CLEAR_CACHE" ||
+      message.type === "YTLL_GEMINI_CLEAR_CACHE"
+    ) {
+      await YTLLTranslationCache.clear();
+      return { ok: true };
+    }
+    if (message.type === "YTLL_CLEAR_ALL_CACHE") {
+      await YTLLCache.clearAll();
       return { ok: true };
     }
     return undefined;

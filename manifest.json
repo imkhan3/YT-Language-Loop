@@ -17,7 +17,8 @@
   "description": "Configure subtitle block looping, audio dubbing, and speed ramping for language learning.",
   "permissions": [
     "storage",
-    "https://*.tts.speech.microsoft.com/*"
+    "https://*.tts.speech.microsoft.com/*",
+    "https://generativelanguage.googleapis.com/*"
   ],
   "background": {
     "scripts": ["tts-cache.js", "background.js"]

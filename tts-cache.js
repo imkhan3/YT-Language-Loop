@@ -1,14 +1,22 @@
 (function () {
   const DB_NAME = "ytll_tts_cache";
   const STORE_NAME = "audio";
+  const TRANSLATION_STORE_NAME = "translations";
   const MAX_ENTRIES = 1500;
+  const DB_VERSION = 2;
 
   function openDatabase() {
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, 1);
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
       request.onupgradeneeded = () => {
-        const store = request.result.createObjectStore(STORE_NAME, { keyPath: "key" });
-        store.createIndex("lastAccessedAt", "lastAccessedAt");
+        if (!request.result.objectStoreNames.contains(STORE_NAME)) {
+          const store = request.result.createObjectStore(STORE_NAME, { keyPath: "key" });
+          store.createIndex("lastAccessedAt", "lastAccessedAt");
+        }
+        if (!request.result.objectStoreNames.contains(TRANSLATION_STORE_NAME)) {
+          const store = request.result.createObjectStore(TRANSLATION_STORE_NAME, { keyPath: "key" });
+          store.createIndex("lastAccessedAt", "lastAccessedAt");
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error || new Error("Could not open TTS audio cache"));
@@ -96,5 +104,95 @@
     }
   }
 
+  async function getTranslation(key) {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(TRANSLATION_STORE_NAME, "readwrite");
+      const store = transaction.objectStore(TRANSLATION_STORE_NAME);
+      const record = await requestResult(store.get(key));
+      if (record) {
+        record.lastAccessedAt = Date.now();
+        store.put(record);
+      }
+      await transactionDone(transaction);
+      return record || null;
+    } finally {
+      database.close();
+    }
+  }
+
+  async function putTranslation(record) {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(TRANSLATION_STORE_NAME, "readwrite");
+      const store = transaction.objectStore(TRANSLATION_STORE_NAME);
+      store.put({
+        key: record.key,
+        translatedText: record.translatedText,
+        createdAt: record.createdAt || Date.now(),
+        lastAccessedAt: Date.now()
+      });
+
+      const count = await requestResult(store.count());
+      const excess = count - MAX_ENTRIES;
+      if (excess > 0) {
+        const index = store.index("lastAccessedAt");
+        const cursorRequest = index.openCursor();
+        let removed = 0;
+        await new Promise((resolve, reject) => {
+          cursorRequest.onerror = () => reject(cursorRequest.error || new Error("Could not evict translation cache entries"));
+          cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result;
+            if (!cursor || removed >= excess) {
+              resolve();
+              return;
+            }
+            cursor.delete();
+            removed += 1;
+            cursor.continue();
+          };
+        });
+      }
+      await transactionDone(transaction);
+    } finally {
+      database.close();
+    }
+  }
+
+  async function clearTranslations() {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(TRANSLATION_STORE_NAME, "readwrite");
+      transaction.objectStore(TRANSLATION_STORE_NAME).clear();
+      await transactionDone(transaction);
+    } finally {
+      database.close();
+    }
+  }
+
+  async function clearAll() {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction([STORE_NAME, TRANSLATION_STORE_NAME], "readwrite");
+      transaction.objectStore(STORE_NAME).clear();
+      transaction.objectStore(TRANSLATION_STORE_NAME).clear();
+      await transactionDone(transaction);
+    } finally {
+      database.close();
+    }
+  }
+
+  const translationCache = {
+    get: getTranslation,
+    put: putTranslation,
+    clear: clearTranslations
+  };
+
   globalThis.YTLLTTSCache = { get, put, clear };
+  globalThis.YTLLTranslationCache = translationCache;
+  globalThis.YTLLCache = {
+    clearAll,
+    clearTts: clear,
+    clearTranslations
+  };
 })();

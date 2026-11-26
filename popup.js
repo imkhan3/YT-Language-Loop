@@ -28,6 +28,8 @@ const DEFAULT_SETTINGS = {
 
 const DEFAULT_TTS_SETTINGS = {
   dubMode: "auto",
+  geminiApiKey: "",
+  geminiModel: "gemini-2.5-flash",
   azureKey: "",
   azureRegion: "eastus",
   azureVoice: "ar-SA-HamedNeural",
@@ -53,6 +55,10 @@ const els = {
   reloadCaptionsBtn: document.getElementById("reloadCaptionsBtn"),
   status: document.getElementById("status"),
   dubMode: document.getElementById("dubMode"),
+  geminiApiKey: document.getElementById("geminiApiKey"),
+  geminiModel: document.getElementById("geminiModel"),
+  testGeminiBtn: document.getElementById("testGeminiBtn"),
+  clearTranslationCacheBtn: document.getElementById("clearTranslationCacheBtn"),
   azureKey: document.getElementById("azureKey"),
   azureRegion: document.getElementById("azureRegion"),
   azureVoice: document.getElementById("azureVoice"),
@@ -116,6 +122,8 @@ function selectedAzureVoice() {
 async function saveTtsSettings(showSaved = true) {
   ttsSettings = {
     dubMode: els.dubMode.value,
+    geminiApiKey: els.geminiApiKey.value,
+    geminiModel: els.geminiModel.value.trim() || DEFAULT_TTS_SETTINGS.geminiModel,
     azureKey: els.azureKey.value,
     azureRegion: els.azureRegion.value.trim() || DEFAULT_TTS_SETTINGS.azureRegion,
     azureVoice: selectedAzureVoice() || DEFAULT_TTS_SETTINGS.azureVoice,
@@ -134,6 +142,8 @@ async function saveTtsSettings(showSaved = true) {
 
 function syncTtsFormFromSettings() {
   els.dubMode.value = ttsSettings.dubMode;
+  els.geminiApiKey.value = ttsSettings.geminiApiKey;
+  els.geminiModel.value = ttsSettings.geminiModel;
   els.azureKey.value = ttsSettings.azureKey;
   els.azureRegion.value = ttsSettings.azureRegion;
   els.overflowBehavior.value = ttsSettings.overflowBehavior;
@@ -175,6 +185,46 @@ async function testVoice() {
     showStatus(`Voice test failed: ${err.message}`, true);
   } finally {
     els.testVoiceBtn.disabled = false;
+  }
+}
+
+async function testGemini() {
+  els.testGeminiBtn.disabled = true;
+  showStatus("Testing Gemini…");
+  try {
+    if (!await saveTtsSettings(false)) {
+      throw new Error("Could not save Gemini settings.");
+    }
+    const result = await browser.runtime.sendMessage({
+      type: "YTLL_GEMINI_TEST",
+      geminiApiKey: els.geminiApiKey.value,
+      geminiModel: els.geminiModel.value.trim() || DEFAULT_TTS_SETTINGS.geminiModel
+    });
+    if (!result || !result.ok) {
+      throw new Error(result?.reason || "Could not translate with Gemini.");
+    }
+    showStatus("Gemini translation works");
+  } catch (err) {
+    console.error("Gemini test failed:", err);
+    showStatus(`Gemini test failed: ${err.message}`, true);
+  } finally {
+    els.testGeminiBtn.disabled = false;
+  }
+}
+
+async function clearTranslationCache() {
+  els.clearTranslationCacheBtn.disabled = true;
+  try {
+    const result = await browser.runtime.sendMessage({ type: "YTLL_TRANSLATION_CLEAR_CACHE" });
+    if (!result || !result.ok) {
+      throw new Error(result?.reason || "Could not clear the translation cache.");
+    }
+    showStatus("Translation cache cleared");
+  } catch (err) {
+    console.error("Failed to clear translation cache:", err);
+    showStatus(`Translation cache clear failed: ${err.message}`, true);
+  } finally {
+    els.clearTranslationCacheBtn.disabled = false;
   }
 }
 
@@ -437,6 +487,8 @@ function bindEvents() {
   els.reloadCaptionsBtn.addEventListener("click", reloadCaptions);
 
   els.dubMode.addEventListener("change", () => saveTtsSettings());
+  els.geminiApiKey.addEventListener("change", () => saveTtsSettings());
+  els.geminiModel.addEventListener("change", () => saveTtsSettings());
   els.azureKey.addEventListener("change", () => saveTtsSettings());
   els.azureRegion.addEventListener("change", () => saveTtsSettings());
   els.azureVoice.addEventListener("change", () => {
@@ -445,6 +497,8 @@ function bindEvents() {
   });
   els.customAzureVoice.addEventListener("change", () => saveTtsSettings());
   els.overflowBehavior.addEventListener("change", () => saveTtsSettings());
+  els.testGeminiBtn.addEventListener("click", testGemini);
+  els.clearTranslationCacheBtn.addEventListener("click", clearTranslationCache);
   els.testVoiceBtn.addEventListener("click", testVoice);
   els.clearTtsCacheBtn.addEventListener("click", clearTtsCache);
 }
@@ -459,6 +513,10 @@ async function init() {
       const prevTts = stored.ttsSettings;
       ttsSettings = {
         dubMode: ["auto", "off", "force"].includes(prevTts.dubMode) ? prevTts.dubMode : DEFAULT_TTS_SETTINGS.dubMode,
+        geminiApiKey: typeof prevTts.geminiApiKey === "string" ? prevTts.geminiApiKey : DEFAULT_TTS_SETTINGS.geminiApiKey,
+        geminiModel: typeof prevTts.geminiModel === "string" && prevTts.geminiModel.trim()
+          ? prevTts.geminiModel.trim()
+          : DEFAULT_TTS_SETTINGS.geminiModel,
         azureKey: typeof prevTts.azureKey === "string" ? prevTts.azureKey : DEFAULT_TTS_SETTINGS.azureKey,
         azureRegion: typeof prevTts.azureRegion === "string" ? prevTts.azureRegion : DEFAULT_TTS_SETTINGS.azureRegion,
         azureVoice: typeof prevTts.azureVoice === "string" ? prevTts.azureVoice : DEFAULT_TTS_SETTINGS.azureVoice,

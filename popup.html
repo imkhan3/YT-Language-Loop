@@ -56,7 +56,7 @@
       </section>
 
       <details class="card tts-card">
-        <summary>AI Dubbing (Azure Fusha TTS)</summary>
+        <summary>AI Translation &amp; Dubbing</summary>
         <div class="field">
           <label for="dubMode">Dubbing mode</label>
           <select id="dubMode">
@@ -64,6 +64,18 @@
             <option value="force">Always use AI dub</option>
             <option value="off">Off</option>
           </select>
+        </div>
+        <div class="field">
+          <label for="geminiApiKey">Gemini API Key</label>
+          <input type="password" id="geminiApiKey" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="geminiModel">Gemini Model</label>
+          <input type="text" id="geminiModel" placeholder="gemini-2.5-flash" autocomplete="off" />
+        </div>
+        <div class="tts-actions">
+          <button type="button" id="testGeminiBtn" class="btn-secondary">Test Gemini</button>
+          <button type="button" id="clearTranslationCacheBtn" class="btn-secondary">Clear Translation Cache</button>
         </div>
         <div class="field">
           <label for="azureKey">Azure Speech Key</label>
