@@ -200,7 +200,6 @@
 }
 
 #yt-lang-loop-subtitle > .ytll-subtitle-target-line {
-  direction: rtl;
   font-family: "Noto Naskh Arabic", "Noto Sans Arabic", Tahoma, Arial, sans-serif;
   line-height: 1.7;
 }

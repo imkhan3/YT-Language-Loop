@@ -2,9 +2,12 @@ const TTS_TEST_PHRASE = "مرحباً بكم، هذا اختبار للصوت ا
 const inFlight = new Map();
 const translationInFlight = new Map();
 
-async function createTranslationCacheKey(text, sourceLang, targetLang, model) {
+async function createTranslationCacheKey(text, sourceLang, targetLang, model, contextSentences = []) {
   const normalized = normalizeText(text);
-  const identity = `${sourceLang.trim().toLowerCase()}::${targetLang.trim().toLowerCase()}::${model.trim()}::${normalized}`;
+  const context = Array.isArray(contextSentences)
+    ? contextSentences.map(item => normalizeText(String(item))).join("||")
+    : "";
+  const identity = `${sourceLang.trim().toLowerCase()}::${targetLang.trim().toLowerCase()}::${model.trim()}::${context}::${normalized}`;
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
   const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
   return `gemini::${hash}`;
@@ -39,7 +42,7 @@ function extractGeminiText(data) {
   throw new Error("Gemini returned no translated text.");
 }
 
-async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, model) {
+async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, model, contextSentences = []) {
   validateGeminiSettings(apiKey, model);
   if (typeof text !== "string" || !text.trim()) {
     throw new Error("Translation text must not be empty.");
@@ -49,8 +52,12 @@ async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, mo
     throw new Error("A source and target language are required.");
   }
 
+  const contextBlock = Array.isArray(contextSentences) && contextSentences.length > 0
+    ? `\nContext from preceding cues:\n${contextSentences.map(item => String(item).trim()).filter(Boolean).join("\n")}\n`
+    : "";
   const prompt =
     `Translate the following text from ${sourceLang.trim()} to ${targetLang.trim()}.\n` +
+    contextBlock +
     "Use natural Modern Standard Arabic where appropriate. Return only the translation, with no notes or quotations.\n\n" +
     text.trim();
 
@@ -77,11 +84,11 @@ async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, mo
   return extractGeminiText(await response.json());
 }
 
-async function translateCached(text, sourceLang, targetLang, forceRefresh) {
+async function translateCached(text, sourceLang, targetLang, forceRefresh, contextSentences = []) {
   const settings = await getTranslationSettings();
   const model = settings.geminiModel;
   validateGeminiSettings(settings.geminiApiKey, model);
-  const key = await createTranslationCacheKey(text, sourceLang, targetLang, model);
+  const key = await createTranslationCacheKey(text, sourceLang, targetLang, model, contextSentences);
 
   if (!forceRefresh) {
     const cached = await YTLLTranslationCache.get(key);
@@ -101,7 +108,8 @@ async function translateCached(text, sourceLang, targetLang, forceRefresh) {
       sourceLang,
       targetLang,
       settings.geminiApiKey,
-      model
+      model,
+      contextSentences
     );
     await YTLLTranslationCache.put({ key, translatedText, createdAt: Date.now() });
     return translatedText;
@@ -281,7 +289,8 @@ browser.runtime.onMessage.addListener(async message => {
         message.text,
         message.sourceLang || "en",
         message.targetLang || "ar",
-        message.forceRefresh === true
+        message.forceRefresh === true,
+        Array.isArray(message.contextSentences) ? message.contextSentences : []
       );
     }
     if (

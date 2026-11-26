@@ -17,6 +17,8 @@
 
   const DEFAULT_TTS_SETTINGS = {
     dubMode: "auto",
+    geminiApiKey: "",
+    geminiKey: "",
     azureKey: "",
     azureRegion: "eastus",
     azureVoice: "ar-SA-HamedNeural",
@@ -29,6 +31,10 @@
   let cues = [];
   let blocks = [];
   let videoMetadata = { title: "", channel: "" };
+  let translationQueue = [];
+  let translationRunning = false;
+  let translationGeneration = 0;
+  const translationInFlight = new Set();
   let currentBlockIdx = 0;
   let currentPassIdx = 0;
   let loopActive = true;
@@ -186,6 +192,7 @@
         cues = segmented;
         captionLoadError = "";
         rebuildBlocksAndSync();
+        scheduleTranslationBatches();
         updateHud();
       }
     }
@@ -424,24 +431,28 @@
 
     return normalizeCues(
       groups.map((group) => {
-        const arabicCues = group.cues.filter((cue) => /[\u0600-\u06FF]/.test(cue.text));
-        const englishCues = group.cues.filter((cue) => !/[\u0600-\u06FF]/.test(cue.text));
+        const targetLang = settings.targetLang || "";
+        const targetScriptCues = ["ar", "he", "fa", "ur"].includes(targetLang)
+          ? group.cues.filter((cue) => /[\u0590-\u08FF]/.test(cue.text))
+          : [];
+        const sourceScriptCues = targetScriptCues.length > 0
+          ? group.cues.filter((cue) => !targetScriptCues.includes(cue))
+          : [];
         let sourceText;
         let targetText;
 
-        if (group.cues.length > 1 && (arabicCues.length === 0 || englishCues.length === 0)) {
+        if (group.cues.length > 1 && targetScriptCues.length === 0) {
           sourceText = group.cues[0].text;
           targetText = group.cues[1].text;
           for (const cue of group.cues.slice(2)) {
-            if (/[\u0600-\u06FF]/.test(cue.text)) {
-              targetText += `\n${cue.text}`;
-            } else {
-              sourceText += `\n${cue.text}`;
-            }
+            targetText += `\n${cue.text}`;
           }
+        } else if (targetScriptCues.length > 0) {
+          sourceText = sourceScriptCues.map((cue) => cue.text).join("\n");
+          targetText = targetScriptCues.map((cue) => cue.text).join("\n");
         } else {
-          sourceText = englishCues.map((cue) => cue.text).join("\n");
-          targetText = arabicCues.map((cue) => cue.text).join("\n");
+          sourceText = group.cues[0].text;
+          targetText = group.cues.slice(1).map((cue) => cue.text).join("\n");
         }
 
         return {
@@ -598,6 +609,7 @@
             cues = segmented;
             captionLoadError = "";
             rebuildBlocksAndSync();
+            scheduleTranslationBatches();
             updateHud();
             return { ok: true, segments: cues.length };
           }
@@ -891,38 +903,151 @@
       return cue.targetText.trim();
     }
     if (usingSrt) return "";
-    return typeof cue?.text === "string" ? cue.text.trim() : "";
+    return "";
   }
 
   function cueNeedsGeneratedTranslation(cue) {
-    const text = cueTargetText(cue);
     return (
       !usingSrt &&
-      matchesLanguageCode(settings.targetLang, "ar") &&
-      Boolean(text) &&
-      !/[\u0600-\u06FF]/.test(text)
+      !(typeof cue?.targetText === "string" && cue.targetText.trim())
     );
   }
 
   async function generateBilingualCuesForDubbing(cuesToCheck) {
+    if (usingSrt || !currentVideoId || !cuesToCheck.some(cueNeedsGeneratedTranslation)) return;
+
+    if (ttsSettings.geminiApiKey.trim()) {
+      scheduleTranslationBatches();
+      return;
+    }
+
+    if (generatedCueAttemptVideoId === currentVideoId) return;
+    const videoId = currentVideoId;
+    const passIdx = currentPassIdx;
+    generatedCueAttemptVideoId = videoId;
+    showDubFeedback("Loading target captions…");
+    const result = await reloadGeneratedCaptions(videoId, null, passIdx);
+    if (!result?.ok && !result?.canceled && currentVideoId === videoId) {
+      showDubFeedback(result?.reason || "Could not load target captions", true);
+    }
+  }
+
+  function getContextSentences(cueIndex) {
+    const context = [];
+    for (let i = Math.max(0, cueIndex - 3); i < cueIndex; i++) {
+      const cue = cues[i];
+      if (!cue) continue;
+      const source = typeof cue.sourceText === "string" ? cue.sourceText.trim() : "";
+      const target = typeof cue.targetText === "string" ? cue.targetText.trim() : "";
+      if (source && target) context.push(`Source: ${source}\nTarget: ${target}`);
+      else if (source) context.push(`Source: ${source}`);
+    }
+    return context;
+  }
+
+  function scheduleTranslationBatches() {
     if (
       usingSrt ||
       !currentVideoId ||
-      generatedCueAttemptVideoId === currentVideoId ||
-      !cuesToCheck.some(cueNeedsGeneratedTranslation)
+      !ttsSettings.geminiApiKey.trim() ||
+      cues.length === 0
     ) {
       return;
     }
 
-    const videoId = currentVideoId;
-    const passIdx = currentPassIdx;
-    generatedCueAttemptVideoId = videoId;
-    showDubFeedback("Loading Arabic target captions…");
-    const result = await reloadGeneratedCaptions(videoId, null, passIdx);
-    if (result?.ok && currentVideoId === videoId && usingGeneratedSrt) {
-      updateHud(currentPassResult?.caps, currentPassResult?.audioRes, currentPassResult?.subRes);
-    } else if (!result?.ok && !result?.canceled && currentVideoId === videoId) {
-      showDubFeedback(result?.reason || "Could not load Arabic target captions", true);
+    const batches = [];
+    let start = 0;
+    let batchIndex = 0;
+    while (start < cues.length) {
+      const size = batchIndex === 0 ? 10 : 30;
+      const end = Math.min(cues.length, start + size);
+      if (cues.slice(start, end).some(cueNeedsGeneratedTranslation)) {
+        batches.push({ id: batchIndex, start, end });
+      }
+      start = end;
+      batchIndex += 1;
+    }
+
+    const queuedIds = new Set(translationQueue.map(batch => batch.id));
+    for (const batch of batches) {
+      if (!queuedIds.has(batch.id) && !translationInFlight.has(batch.id)) {
+        translationQueue.push(batch);
+      }
+    }
+
+    const activeBatchIds = new Set();
+    const firstCueIndex = blocks[currentBlockIdx]?.subStartNum - 1;
+    const nextBlock = blocks[currentBlockIdx + 1];
+    const nextFirstCueIndex = nextBlock ? nextBlock.subStartNum - 1 : cues.length;
+    if (Number.isInteger(firstCueIndex) && firstCueIndex >= 0) {
+      for (const batch of batches) {
+        if (batch.start <= firstCueIndex && firstCueIndex < batch.end) activeBatchIds.add(batch.id);
+      }
+    }
+    for (const batch of batches) {
+      if (batch.start <= nextFirstCueIndex && nextFirstCueIndex < batch.end) activeBatchIds.add(batch.id);
+    }
+
+    translationQueue.sort((a, b) => {
+      const aPriority = activeBatchIds.has(a.id) ? (a.start <= (firstCueIndex || 0) ? 0 : 1) : 2;
+      const bPriority = activeBatchIds.has(b.id) ? (b.start <= (firstCueIndex || 0) ? 0 : 1) : 2;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      return a.id - b.id;
+    });
+
+    pumpTranslationQueue();
+  }
+
+  async function pumpTranslationQueue() {
+    if (translationRunning) return;
+    translationRunning = true;
+    try {
+      while (translationQueue.length > 0) {
+        const batch = translationQueue.shift();
+        if (translationInFlight.has(batch.id)) continue;
+        if (!cues.slice(batch.start, batch.end).some(cueNeedsGeneratedTranslation)) continue;
+
+        const generation = translationGeneration;
+        const videoId = currentVideoId;
+        translationInFlight.add(batch.id);
+        try {
+          for (let cueIndex = batch.start; cueIndex < batch.end; cueIndex++) {
+            if (generation !== translationGeneration || videoId !== currentVideoId) break;
+            const cue = cues[cueIndex];
+            if (!cue || cue.targetText?.trim()) continue;
+            const sourceText = typeof cue.sourceText === "string"
+              ? cue.sourceText.trim()
+              : (typeof cue.text === "string" ? cue.text.trim() : "");
+            if (!sourceText) continue;
+
+            const result = await browser.runtime.sendMessage({
+              type: "YTLL_TRANSLATE",
+              text: sourceText,
+              sourceLang: settings.sourceLang,
+              targetLang: settings.targetLang,
+              contextSentences: getContextSentences(cueIndex)
+            });
+            if (!result?.ok) throw new Error(result?.reason || "Translation failed");
+            if (generation !== translationGeneration || videoId !== currentVideoId) break;
+            cue.targetText = result.translatedText.trim();
+          }
+        } catch (error) {
+          if (generation === translationGeneration && videoId === currentVideoId) {
+            showDubFeedback(error.message || "Translation failed", true);
+          }
+        } finally {
+          translationInFlight.delete(batch.id);
+        }
+
+        if (generation === translationGeneration && videoId === currentVideoId) {
+          renderCustomSubtitle();
+          ensureDubPrefetchForCurrentBlock();
+          updateHud();
+        }
+      }
+    } finally {
+      translationRunning = false;
+      if (translationQueue.length > 0) pumpTranslationQueue();
     }
   }
 
@@ -1367,6 +1492,7 @@
       currentPassResult = null;
       updateHud();
       renderCustomSubtitle();
+      scheduleTranslationBatches();
 
       if (video) video.muted = true;
       const blk = blocks[currentBlockIdx];
@@ -1443,6 +1569,10 @@
   function rebuildBlocksAndSync() {
     stopDubPlayback();
     clearDubAudioUrls();
+    translationGeneration += 1;
+    translationQueue = [];
+    translationRunning = false;
+    translationInFlight.clear();
     blocks = buildBlocks(cues, settings.subtitlesPerLoop || 5);
     const video = getVideoElement();
     const curTime = video ? video.currentTime : 0;
@@ -1463,6 +1593,9 @@
     const subMode = getPassConfig(currentPassIdx).subMode;
     const targetLine = hud.subtitleTargetLine;
     const sourceLine = hud.subtitleSourceLine;
+    targetLine.dir = ["ar", "he", "fa", "ur"].includes(settings.targetLang)
+      ? "rtl"
+      : "ltr";
     if (!usingSrt || !settings.enabled || !video || subMode === "off") {
       targetLine.hidden = true;
       sourceLine.hidden = true;
@@ -1679,6 +1812,7 @@
       if (blocks.length === 0) return;
       const idx = Math.max(0, currentBlockIdx - 1);
       runTransition(idx, 0, blocks[idx].start);
+      scheduleTranslationBatches();
     });
 
     repeatBtn.addEventListener("click", (e) => {
@@ -1981,6 +2115,7 @@
       if (blocks.length === 0) return;
       currentBlockIdx = findBlockIndexForTime(video.currentTime);
       currentPassIdx = 0;
+      scheduleTranslationBatches();
     });
     video.addEventListener("seeked", () => {
       if (transitionInProgress || programmaticSeekTarget !== null) return;
@@ -2001,6 +2136,7 @@
       currentBlockIdx = findBlockIndexForTime(video.currentTime);
       currentPassIdx = 0;
       currentPassResult = null;
+      scheduleTranslationBatches();
       applyPassSettings(0);
     });
   }
@@ -2102,10 +2238,16 @@
 
   function normalizeTtsSettings(value) {
     const stored = value && typeof value === "object" ? value : {};
+    const geminiApiKey =
+      typeof stored.geminiApiKey === "string" ? stored.geminiApiKey :
+      typeof stored.geminiKey === "string" ? stored.geminiKey :
+      DEFAULT_TTS_SETTINGS.geminiApiKey;
     return {
       dubMode: ["auto", "force", "off"].includes(stored.dubMode)
         ? stored.dubMode
         : DEFAULT_TTS_SETTINGS.dubMode,
+      geminiApiKey,
+      geminiKey: geminiApiKey,
       azureKey: typeof stored.azureKey === "string" ? stored.azureKey : DEFAULT_TTS_SETTINGS.azureKey,
       azureRegion: typeof stored.azureRegion === "string" ? stored.azureRegion : DEFAULT_TTS_SETTINGS.azureRegion,
       azureVoice: typeof stored.azureVoice === "string" ? stored.azureVoice : DEFAULT_TTS_SETTINGS.azureVoice,
