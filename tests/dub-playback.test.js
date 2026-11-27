@@ -4,8 +4,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function createHarness(cues, blockSize = 5, speed = 1) {
+function createHarness(cues, blockSize = 5, speed = 1, manualPreloadTimer = false) {
   const audios = [];
+  const timers = new Map();
+  let nextTimer = 0;
   let urlCount = 0;
   class MockAudio {
     constructor() {
@@ -80,7 +82,18 @@ function createHarness(cues, blockSize = 5, speed = 1) {
       runtime: { getURL: value => value, onMessage: { addListener() {} }, async sendMessage() { return { ok: true }; } },
       storage: { onChanged: { addListener() {} } }
     },
-    setTimeout() { return 1; }, clearTimeout() {}, setInterval() {}, clearInterval() {}
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, delay });
+      if (delay === 80 && !manualPreloadTimer) {
+        queueMicrotask(() => {
+          if (timers.delete(id)) callback();
+        });
+      }
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    setInterval() {}, clearInterval() {}
   };
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
     .replace(/\}\)\(\);\s*$/, `
@@ -108,16 +121,28 @@ function createHarness(cues, blockSize = 5, speed = 1) {
           dubDesiredCueKeys.add(key);
           storeDubCueAudio({ key, cueIdx: index, videoId: currentVideoId, generation: dubCacheGeneration }, "", "audio/wav");
         },
-        syncDubPlayback, stopDubPlayback,
+        syncDubPlayback, stopDubPlayback, preloadNextDubCue,
         waitForDubEnd() { waitingForDubEnd = true; },
         activeAudio() { return dubAudio; },
         activeIndex() { return activeDubCueIdx; },
-        preloadKey() { return preloadedDubCueKey; }
+        preloadKey() { return preloadedDubCueKey; },
+        preloadResult() { return preloadPromise; }
       };
     })();`);
   vm.runInNewContext(source, context);
   context.testHooks.setup(cues, blockSize, speed);
-  return { hooks: context.testHooks, audios, video };
+  return {
+    hooks: context.testHooks, audios, video,
+    timerDelays() { return Array.from(timers.values(), timer => timer.delay); },
+    fireTimers(delay) {
+      for (const [id, timer] of timers) {
+        if (timer.delay === delay) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    }
+  };
 }
 
 const cues = [
@@ -126,6 +151,47 @@ const cues = [
   { start: 2, end: 3, sourceText: "three", targetText: "three" }
 ];
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test("preload waits for canplay and cleans up its grace timer and listeners", async () => {
+  const h = createHarness(cues, 5, 1, true);
+  h.hooks.addUrl(1, "blob:1");
+  h.hooks.preloadNextDubCue(0);
+  let settled = false;
+  const ready = h.hooks.preloadResult().then(value => { settled = true; return value; });
+  await flush();
+  assert.equal(settled, false);
+  assert.equal(h.timerDelays().includes(80), true);
+  h.audios[1].readyState = 3;
+  h.audios[1].emit("canplay");
+  assert.equal(await ready, true);
+  assert.equal(h.timerDelays().includes(80), false);
+  assert.equal(h.audios[1].listeners.get("canplay").size, 0);
+});
+
+test("preload falls back to metadata after 80ms without canplay", async () => {
+  const h = createHarness(cues, 5, 1, true);
+  h.hooks.addUrl(1, "blob:1");
+  h.hooks.preloadNextDubCue(0);
+  const ready = h.hooks.preloadResult();
+  h.fireTimers(80);
+  assert.equal(await ready, true);
+  assert.equal(h.timerDelays().includes(8000), false);
+});
+
+test("using a metadata-ready deck cancels its pending preload grace period", async () => {
+  const h = createHarness(cues, 5, 1, true);
+  h.hooks.addUrl(0, "blob:0");
+  h.hooks.addUrl(1, "blob:1");
+  h.hooks.syncDubPlayback(h.video);
+  await flush();
+  assert.equal(h.timerDelays().includes(80), true);
+  h.video.currentTime = 0.95;
+  h.audios[0].finish();
+  await flush();
+  assert.equal(h.audios[1].playCount, 1);
+  assert.equal(h.timerDelays().includes(80), false);
+  assert.equal(h.audios[1].listeners.get("canplay").size, 0);
+});
 
 test("preloads and alternates decks without reloading or restarting an early cue", async () => {
   const h = createHarness(cues);

@@ -72,6 +72,9 @@
   let dubAudioUnlocking = false;
   let dubAudioPlayBlocked = false;
   let silentAudioDataUrl = "";
+  let warmAudioContext = null;
+  let warmAudioRequested = false;
+  let warmAudioRevision = 0;
   let dubMuteActive = false;
   let videoMutedBeforeDub = false;
   let dubMutedVideo = null;
@@ -666,12 +669,13 @@
     for (let i = 0; i < cueList.length; i += size) {
       const slice = cueList.slice(i, i + size);
       const lastCue = slice[slice.length - 1];
+      const prevCue = cueList[i - 1];
       const nextCue = cueList[i + size];
       result.push({
         index: result.length,
         subStartNum: i + 1,
         subEndNum: i + slice.length,
-        start: Math.max(0, slice[0].start - 0.03),
+        start: Math.max(prevCue ? prevCue.end + 0.01 : 0, slice[0].start - 0.25),
         end: nextCue
           ? Math.min(lastCue.end + 0.04, nextCue.start - 0.02)
           : lastCue.end + 0.04
@@ -779,7 +783,76 @@
     return silentAudioDataUrl;
   }
 
+  function keepAudioPipelineWarm() {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (typeof AudioContext !== "function" || !settings.enabled || !loopActive || !currentVideoId) return;
+
+    if (!warmAudioContext || warmAudioContext.state === "closed") {
+      let context;
+      try {
+        context = new AudioContext();
+        const source = context.createBufferSource();
+        source.buffer = context.createBuffer(1, context.sampleRate, context.sampleRate);
+        source.loop = true;
+        source.connect(context.destination);
+        source.start();
+        warmAudioContext = context;
+        warmAudioRequested = false;
+      } catch (error) {
+        console.warn("[YT Lang Loop] Could not initialize the audio pipeline:", error);
+        if (context) {
+          try {
+            Promise.resolve(context.close()).catch(closeError => {
+              console.warn("[YT Lang Loop] Could not close the audio pipeline:", closeError);
+            });
+          } catch (closeError) {
+            console.warn("[YT Lang Loop] Could not close the audio pipeline:", closeError);
+          }
+        }
+        return;
+      }
+    }
+
+    if (!warmAudioRequested || warmAudioContext.state !== "running") {
+      warmAudioRequested = true;
+      const revision = ++warmAudioRevision;
+      const context = warmAudioContext;
+      try {
+        Promise.resolve(context.resume()).then(() => {
+          if (context === warmAudioContext && !warmAudioRequested && context.state !== "closed") {
+            suspendAudioContext(context);
+          }
+        }).catch(error => {
+          console.warn("[YT Lang Loop] Could not resume the audio pipeline:", error);
+          if (revision === warmAudioRevision) warmAudioRequested = false;
+        });
+      } catch (error) {
+        warmAudioRequested = false;
+        console.warn("[YT Lang Loop] Could not resume the audio pipeline:", error);
+      }
+    }
+  }
+
+  function suspendAudioContext(context) {
+    try {
+      Promise.resolve(context.suspend()).catch(error => {
+        console.warn("[YT Lang Loop] Could not suspend the audio pipeline:", error);
+      });
+    } catch (error) {
+      console.warn("[YT Lang Loop] Could not suspend the audio pipeline:", error);
+    }
+  }
+
+  function suspendAudioPipelineWhenIdle() {
+    if (!warmAudioContext || !warmAudioRequested ||
+        (settings.enabled && loopActive && currentVideoId)) return;
+    warmAudioRequested = false;
+    warmAudioRevision++;
+    suspendAudioContext(warmAudioContext);
+  }
+
   function unlockDubAudio() {
+    keepAudioPipelineWarm();
     if (dubAudioUnlocked || dubAudioUnlocking) return;
     if (dubAudio.src && !dubAudio.paused && dubAudio.src !== silentAudioDataUrl) return;
 
@@ -1285,7 +1358,8 @@
     }
 
     const selected = silences.sort((a, b) => a.start - b.start);
-    const paddingFrames = Math.floor(decoded.sampleRate * 0.02);
+    const leadingPaddingFrames = Math.floor(decoded.sampleRate * 0.10);
+    const trailingPaddingFrames = Math.floor(decoded.sampleRate * 0.02);
     const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
     const isSilentFrame = frame => channels.every(channel => Math.abs(channel[frame]) < 0.005);
     let firstSound = 0;
@@ -1293,13 +1367,13 @@
     let lastSound = decoded.length;
     while (lastSound > firstSound && isSilentFrame(lastSound - 1)) lastSound--;
     const ranges = [];
-    let startFrame = Math.max(0, firstSound - paddingFrames);
+    let startFrame = Math.max(0, firstSound - leadingPaddingFrames);
     for (const silence of selected) {
-      const endFrame = Math.min(decoded.length, silence.start + paddingFrames);
+      const endFrame = Math.min(decoded.length, silence.start + trailingPaddingFrames);
       ranges.push([startFrame, endFrame]);
-      startFrame = Math.max(0, silence.end - paddingFrames);
+      startFrame = Math.max(0, silence.end - leadingPaddingFrames);
     }
-    ranges.push([startFrame, Math.min(decoded.length, lastSound + paddingFrames)]);
+    ranges.push([startFrame, Math.min(decoded.length, lastSound + trailingPaddingFrames)]);
     if (ranges.length !== itemCount || ranges.some(([start, end]) => end - start < decoded.sampleRate * 0.08)) {
       return null;
     }
@@ -1565,17 +1639,28 @@
       preloadedDubCueKey = key;
       preloadPromise = new Promise(resolve => {
         let finished = false;
+        let metadataTimeout = null;
         const finish = ready => {
           if (finished) return;
           finished = true;
           clearTimeout(timeout);
+          if (metadataTimeout !== null) clearTimeout(metadataTimeout);
           audio.removeEventListener?.("loadedmetadata", onLoaded);
+          audio.removeEventListener?.("canplay", onCanPlay);
           audio.removeEventListener?.("error", onError);
           cancelDubPreload = null;
           if (!ready && preloadedDubCueKey === key) preloadedDubCueKey = "";
           resolve(ready);
         };
-        const onLoaded = () => finish(true);
+        const onLoaded = () => {
+          if (audio.readyState >= 3) finish(true);
+          else if (metadataTimeout === null) {
+            metadataTimeout = setTimeout(() => finish(true), 80);
+          }
+        };
+        const onCanPlay = () => {
+          if (audio.readyState >= 3) finish(true);
+        };
         const onError = () => {
           console.warn("[YT Lang Loop] Could not preload synthesized audio.");
           finish(false);
@@ -1586,11 +1671,12 @@
         }, 8000);
         cancelDubPreload = () => finish(false);
         audio.addEventListener("loadedmetadata", onLoaded);
+        audio.addEventListener("canplay", onCanPlay);
         audio.addEventListener("error", onError);
         try {
           audio.src = url;
           audio.load();
-          if (audio.readyState >= 1) finish(true);
+          if (audio.readyState >= 1) onLoaded();
         } catch (error) {
           console.warn("[YT Lang Loop] Could not preload synthesized audio:", error);
           finish(false);
@@ -1607,6 +1693,7 @@
       if (requestId !== dubPlaybackRequest) return;
       if (!dubAudioUnlocking && ready && preloadedDubCueKey === key &&
           preloadAudio.src === url && preloadAudio.readyState >= 1) {
+        if (cancelDubPreload) cancelDubPreload();
         const previousAudio = dubAudio;
         dubAudio = preloadAudio;
         preloadAudio = previousAudio;
@@ -2428,6 +2515,7 @@
       e.stopPropagation();
       unlockDubAudio();
       loopActive = !loopActive;
+      if (loopActive) keepAudioPipelineWarm();
       const video = getVideoElement();
       if (!loopActive && video) {
         setDubMuteActive(false, video);
@@ -2567,6 +2655,7 @@
   }
 
   function syncLoopTickerState() {
+    suspendAudioPipelineWhenIdle();
     const shouldRun = (currentVideoId && settings.enabled && loopActive) ||
       waitingForDubEnd || waitingForDubBuffer;
     if (shouldRun && tickTimer === null) {

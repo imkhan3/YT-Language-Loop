@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function createHarness(decodedAudio = null) {
+function createHarness(decodedAudio = null, AudioContext = undefined) {
   const sent = [];
   let pageListener;
   let storageListener;
@@ -19,7 +19,9 @@ function createHarness(decodedAudio = null) {
   let decoderRate;
   const audios = [];
   const intervals = new Map();
+  const timers = new Set();
   let nextInterval = 0;
+  let nextTimer = 0;
   let time = 0;
   const videoListeners = new Map();
   const video = {
@@ -80,7 +82,8 @@ function createHarness(decodedAudio = null) {
     OfflineAudioContext: class {
       constructor(channels, length, sampleRate) { decoderRate = sampleRate; }
       async decodeAudioData() { return decodedAudio; }
-    }
+    },
+    AudioContext
   };
   const browser = {
     runtime: {
@@ -114,7 +117,13 @@ function createHarness(decodedAudio = null) {
     atob: text => Buffer.from(text, "base64").toString("binary"),
     btoa: text => Buffer.from(text, "binary").toString("base64"),
     Blob,
-    setTimeout() { return 1; }, clearTimeout() {},
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.add(id);
+      if (delay === 80) queueMicrotask(() => { if (timers.delete(id)) callback(); });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
     setInterval(callback) { const id = ++nextInterval; intervals.set(id, callback); return id; },
     clearInterval(id) { intervals.delete(id); }
   };
@@ -163,7 +172,8 @@ function createHarness(decodedAudio = null) {
         },
         shouldPrefetchAiDub, shouldUseAiDub, ensureDubPrefetchForCurrentBlock,
         applyPassSettings, runTransition, generateBilingualCuesForDubbing,
-        findBatchSilences, splitBatchAudio, findDubCueIndexForTime, initForCurrentVideo,
+        buildBlocks, unlockDubAudio, findBatchSilences, splitBatchAudio,
+        findDubCueIndexForTime, initForCurrentVideo,
         queue() { return translationQueue; },
         desired() { return Array.from(dubDesiredCueKeys); },
         currentResult() { return currentPassResult; },
@@ -190,6 +200,94 @@ const passes = [
   { audio: "target", subtitles: "target", speed: 0.75 },
   { audio: "target", subtitles: "target", speed: 1 }
 ];
+
+test("block pre-roll uses available silence without crossing the preceding cue", () => {
+  const h = createHarness();
+  const cues = [
+    { start: 0.1, end: 1 },
+    { start: 1.1, end: 2 },
+    { start: 3, end: 4 }
+  ];
+  const blocks = h.hooks.buildBlocks(cues, 1);
+  assert.equal(blocks[0].start, 0);
+  assert.equal(blocks[1].start, 1.01);
+  assert.equal(blocks[2].start, 2.75);
+});
+
+test("warms one silent audio context after unlocking and suspends it when idle", async () => {
+  const contexts = [];
+  class MockAudioContext {
+    constructor() {
+      this.state = "suspended";
+      this.sampleRate = 24000;
+      this.destination = {};
+      this.resumeCount = 0;
+      this.suspendCount = 0;
+      contexts.push(this);
+    }
+    createBuffer(channels, length, rate) { return { channels, length, rate }; }
+    createBufferSource() {
+      const context = this;
+      return {
+        connect(destination) { context.connected = destination; },
+        start() { context.source = this; }
+      };
+    }
+    resume() { this.resumeCount++; this.state = "running"; return Promise.resolve(); }
+    suspend() { this.suspendCount++; this.state = "suspended"; return Promise.resolve(); }
+  }
+  const h = createHarness(null, MockAudioContext);
+  h.hooks.setTickerState("", true, true, false, false);
+  h.hooks.unlockDubAudio();
+  assert.equal(contexts.length, 0);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.hooks.unlockDubAudio();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(contexts.length, 1);
+  assert.deepEqual(contexts[0].source.buffer, { channels: 1, length: 24000, rate: 24000 });
+  assert.equal(contexts[0].source.loop, true);
+  assert.equal(contexts[0].connected, contexts[0].destination);
+  assert.equal(contexts[0].resumeCount, 1);
+  h.hooks.setTickerState("video1", false, true, false, false);
+  assert.equal(contexts[0].suspendCount, 1);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.hooks.unlockDubAudio();
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].resumeCount, 2);
+  h.hooks.setTickerState("", true, true, false, false);
+  assert.equal(contexts[0].suspendCount, 2);
+});
+
+test("suspends the audio context if a pending resume completes after leaving the video", async () => {
+  let context;
+  let finishResume;
+  class MockAudioContext {
+    constructor() {
+      context = this;
+      this.state = "suspended";
+      this.sampleRate = 24000;
+      this.destination = {};
+      this.suspendCount = 0;
+    }
+    createBuffer() { return {}; }
+    createBufferSource() { return { connect() {}, start() {} }; }
+    resume() {
+      return new Promise(resolve => {
+        finishResume = () => { this.state = "running"; resolve(); };
+      });
+    }
+    suspend() { this.suspendCount++; this.state = "suspended"; return Promise.resolve(); }
+  }
+  const h = createHarness(null, MockAudioContext);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.hooks.unlockDubAudio();
+  h.hooks.setTickerState("", true, true, false, false);
+  assert.equal(context.suspendCount, 1);
+  finishResume();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(context.state, "suspended");
+  assert.equal(context.suspendCount, 2);
+});
 
 test("prunes old and distant dub URLs while retaining adjacent blocks and playback decks", () => {
   const h = createHarness();
@@ -659,14 +757,14 @@ test("detects silence runs at the 0.55-second and 0.005 amplitude thresholds", (
   ]);
 });
 
-test("splits at silence edges and trims leading and trailing silence with 20ms pads", async () => {
+test("splits at silence edges with 100ms leading and 20ms trailing pads", async () => {
   const audio = audioBuffer([[0.2, 0], [0.3, 0.5], [1.1, 0], [0.35, 0.5], [0.15, 0]]);
   const h = createHarness(audio);
   const chunks = await h.hooks.splitBatchAudio("", 2);
   assert.equal(h.decoderRate(), 24000);
   assert.equal(chunks.length, 2);
-  assert.equal(chunks[0].byteLength, 44 + 2 * Math.round(24000 * 0.34));
-  assert.equal(chunks[1].byteLength, 44 + 2 * Math.round(24000 * 0.39));
+  assert.equal(chunks[0].byteLength, 44 + 2 * Math.round(24000 * 0.42));
+  assert.equal(chunks[1].byteLength, 44 + 2 * Math.round(24000 * 0.47));
   assert.equal(new DataView(chunks[0]).getUint32(24, true), 24000);
 });
 
@@ -676,6 +774,7 @@ test("chooses longest separators when natural pauses occur, but rejects ambiguou
   const chunks = await h.hooks.splitBatchAudio("", 2);
   assert.equal(chunks.length, 2);
   assert.equal(chunks[0].byteLength, 44 + 2 * Math.round(24000 * 1.12));
+  assert.equal(chunks[1].byteLength, 44 + 2 * Math.round(24000 * 0.40));
   const ambiguous = createHarness(audioBuffer([[0.3, 0.5], [0.6, 0], [0.2, 0.5], [0.6, 0], [0.3, 0.5]]));
   assert.equal(await ambiguous.hooks.splitBatchAudio("", 2), null);
 });
