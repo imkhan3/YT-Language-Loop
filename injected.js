@@ -22,7 +22,15 @@
 
   // Cache captured timedtext responses by videoId + languageCode
   const timedtextCache = new Map();
+  const MAX_TIMEDTEXT_ENTRIES = 12;
   let lastSetAudioTrack = null;
+
+  function cacheTimedtext(key, text) {
+    if (!timedtextCache.has(key) && timedtextCache.size >= MAX_TIMEDTEXT_ENTRIES) {
+      timedtextCache.delete(timedtextCache.keys().next().value);
+    }
+    timedtextCache.set(key, text);
+  }
 
   function postToContent(type, payload = {}) {
     window.postMessage({ source: SOURCE_PAGE, type, payload }, "*");
@@ -64,7 +72,7 @@
       const v = url.searchParams.get("v") || getVideoId();
       const lang = url.searchParams.get("tlang") || url.searchParams.get("lang") || "";
       if (v && lang && text && text.trim().length > 0) {
-        timedtextCache.set(`${v}:${lang.toLowerCase()}`, text);
+        cacheTimedtext(`${v}:${lang.toLowerCase()}`, text);
         postToContent("TIMEDTEXT_CAPTURED", { videoId: v, lang: lang.toLowerCase(), raw: text });
       }
     } catch (_) {}
@@ -323,7 +331,7 @@
         if (res.ok) {
           const text = await res.text();
           if (text && text.trim().length > 0) {
-            timedtextCache.set(`${videoId}:${langCode.toLowerCase()}`, text);
+            cacheTimedtext(`${videoId}:${langCode.toLowerCase()}`, text);
             return {
               ok: true,
               raw: text,
@@ -410,7 +418,7 @@
     url.searchParams.set("fmt", "json3");
     if (tlang) url.searchParams.set("tlang", tlang);
 
-    const res = await fetch(url.toString(), { credentials: "include" });
+    const res = await origFetch(url.toString(), { credentials: "include" });
     if (!res.ok) throw new Error(`Failed to fetch captions (${res.status})`);
     const text = await res.text();
     if (!text) throw new Error("Empty caption response (YouTube may require a pot token).");

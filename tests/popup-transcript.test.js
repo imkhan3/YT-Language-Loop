@@ -44,7 +44,10 @@ function createHarness() {
     createElement() { return new Element(); }
   };
   const browser = {
-    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    runtime: {
+      onMessage: { addListener(listener) { onMessage = listener; } },
+      async sendMessage(message) { sent.push(message); return { ok: true }; }
+    },
     tabs: {
       async query() { return [{ id: 7 }]; },
       async sendMessage(id, message) {
@@ -178,4 +181,13 @@ test("shows a helpful empty state when the active tab cannot provide a transcrip
     h.element("transcriptList").children[0].textContent,
     "Open a YouTube video to view the transcript."
   );
+});
+
+test("clearing audio cache notifies the active tab after storage is cleared", async () => {
+  const h = createHarness();
+  await h.element("clearTtsCacheBtn").dispatch("click");
+  assert.deepEqual(h.sent.map(message => message.type), [
+    "YTLL_TTS_CLEAR_CACHE", "YTLL_TTS_CACHE_CLEARED"
+  ]);
+  assert.equal(h.sent[1].id, 7);
 });

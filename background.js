@@ -1,6 +1,7 @@
 const TTS_TEST_PHRASE = "مرحباً بكم، هذا اختبار للصوت العربي الفصيح.";
 const inFlight = new Map();
 const translationInFlight = new Map();
+let audioCacheGeneration = 0;
 const BATCH_SSML_BREAK = '<break time="1100ms"/>';
 
 async function createTranslationCacheKey(text, sourceLang, targetLang, model, contextSentences = []) {
@@ -68,10 +69,10 @@ async function requestGeminiTranslation(text, sourceLang, targetLang, apiKey, mo
 
   const modelName = encodeURIComponent(model.trim());
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey.trim() },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: {
@@ -136,7 +137,7 @@ async function requestGeminiBatchTranslation(items, sourceLang, targetLang, apiK
     JSON.stringify(payloadItems);
 
   const modelName = encodeURIComponent(model.trim());
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
 
   const sendRequest = async (useSchema) => {
     const generationConfig = {
@@ -159,7 +160,7 @@ async function requestGeminiBatchTranslation(items, sourceLang, targetLang, apiK
     }
     return fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey.trim() },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig
@@ -232,22 +233,27 @@ async function translateBatchCached(items, sourceLang, targetLang, forceRefresh)
   const uncached = [];
   let cachedCount = 0;
 
+  const validItems = [];
   for (const item of items) {
     const index = item?.index;
     const text = typeof item?.text === "string" ? item.text.trim() : "";
     const prevContext = Array.isArray(item?.prevContext) ? item.prevContext : [];
     if (!Number.isInteger(index) || !text) continue;
-
-    const key = await createTranslationCacheKey(text, sourceLang, targetLang, model, prevContext);
-    if (!forceRefresh) {
-      const cached = await YTLLTranslationCache.get(key);
-      if (cached?.translatedText) {
-        translations[index] = cached.translatedText;
-        cachedCount += 1;
-        continue;
-      }
+    validItems.push({ index, text, prevContext });
+  }
+  const candidates = await Promise.all(validItems.map(async item => ({
+    ...item,
+    key: await createTranslationCacheKey(item.text, sourceLang, targetLang, model, item.prevContext)
+  })));
+  const cachedRecords = forceRefresh ? [] : await YTLLTranslationCache.getBatch(candidates.map(item => item.key));
+  for (let i = 0; i < candidates.length; i++) {
+    const item = candidates[i];
+    if (cachedRecords[i]?.translatedText) {
+      translations[item.index] = cachedRecords[i].translatedText;
+      cachedCount += 1;
+    } else {
+      uncached.push(item);
     }
-    uncached.push({ index, text, prevContext, key });
   }
 
   if (uncached.length === 0) {
@@ -257,11 +263,12 @@ async function translateBatchCached(items, sourceLang, targetLang, forceRefresh)
   const batchKey = `batch::${uncached.map(item => item.key).join(",")}`;
   if (translationInFlight.has(batchKey)) {
     const shared = await translationInFlight.get(batchKey);
-    return { ok: true, translations: { ...translations, ...shared }, cachedCount, fetchedCount: 0 };
+    uncached.forEach((item, index) => { translations[item.index] = shared[index]; });
+    return { ok: true, translations, cachedCount, fetchedCount: 0 };
   }
 
   const batchJob = (async () => {
-    const batchResults = {};
+    let batchResults;
     if (uncached.length === 1) {
       const single = uncached[0];
       const translatedText = await requestGeminiTranslation(
@@ -272,42 +279,38 @@ async function translateBatchCached(items, sourceLang, targetLang, forceRefresh)
         model,
         single.prevContext
       );
-      await YTLLTranslationCache.put({ key: single.key, translatedText, createdAt: Date.now() });
-      batchResults[single.index] = translatedText;
-      return batchResults;
-    }
-
-    const byId = await requestGeminiBatchTranslation(
-      uncached,
-      sourceLang,
-      targetLang,
-      settings.geminiApiKey,
-      model
-    );
-
-    for (let i = 0; i < uncached.length; i++) {
-      const item = uncached[i];
-      let translatedText = byId.get(i);
-      if (!translatedText) {
-        translatedText = await requestGeminiTranslation(
+      batchResults = [translatedText];
+    } else {
+      const byId = await requestGeminiBatchTranslation(
+        uncached,
+        sourceLang,
+        targetLang,
+        settings.geminiApiKey,
+        model
+      );
+      batchResults = await Promise.all(uncached.map((item, index) =>
+        byId.get(index) || requestGeminiTranslation(
           item.text,
           sourceLang,
           targetLang,
           settings.geminiApiKey,
           model,
           item.prevContext
-        );
-      }
-      await YTLLTranslationCache.put({ key: item.key, translatedText, createdAt: Date.now() });
-      batchResults[item.index] = translatedText;
+        )
+      ));
     }
+    await YTLLTranslationCache.putTranslationBatch(uncached.map((item, index) => ({
+      key: item.key,
+      translatedText: batchResults[index],
+      createdAt: Date.now()
+    })));
     return batchResults;
   })();
 
   translationInFlight.set(batchKey, batchJob);
   try {
     const batchResults = await batchJob;
-    Object.assign(translations, batchResults);
+    uncached.forEach((item, index) => { translations[item.index] = batchResults[index]; });
     return {
       ok: true,
       translations,
@@ -450,6 +453,7 @@ async function getTtsSettings() {
 }
 
 async function synthesizeCached(text, voice, forceRefresh) {
+  const generation = audioCacheGeneration;
   const settings = await getTtsSettings();
   const selectedVoice = voice || settings.azureVoice;
   validateVoice(selectedVoice);
@@ -468,6 +472,9 @@ async function synthesizeCached(text, voice, forceRefresh) {
     }
   }
 
+  if (generation !== audioCacheGeneration) {
+    throw new Error("Audio cache was cleared during the request.");
+  }
   if (inFlight.has(key)) {
     const audio = await inFlight.get(key);
     return {
@@ -482,7 +489,9 @@ async function synthesizeCached(text, voice, forceRefresh) {
     validateCredentials(settings.azureKey, settings.azureRegion, voiceName);
     const arrayBuffer = await requestSpeech(text, settings.azureKey, settings.azureRegion, voiceName);
     const mimeType = "audio/mpeg";
-    await YTLLTTSCache.put({ key, arrayBuffer, mimeType, createdAt: Date.now() });
+    if (generation === audioCacheGeneration) {
+      await YTLLTTSCache.put({ key, arrayBuffer, mimeType, createdAt: Date.now() });
+    }
     return { arrayBuffer, mimeType };
   })();
   inFlight.set(key, synthesis);
@@ -495,11 +504,12 @@ async function synthesizeCached(text, voice, forceRefresh) {
       cached: false
     };
   } finally {
-    inFlight.delete(key);
+    if (inFlight.get(key) === synthesis) inFlight.delete(key);
   }
 }
 
 async function synthesizeBatchCached(items, voice) {
+  const generation = audioCacheGeneration;
   const settings = await getTtsSettings();
   const selectedVoice = voice || settings.azureVoice;
   validateVoice(selectedVoice);
@@ -513,6 +523,7 @@ async function synthesizeBatchCached(items, voice) {
   const failedItems = [];
   const uncachedItems = [];
 
+  const validItems = [];
   for (const item of items) {
     const clientKey = item?.key;
     const text = typeof item?.text === "string" ? item.text : "";
@@ -523,8 +534,19 @@ async function synthesizeBatchCached(items, voice) {
       continue;
     }
 
-    const cacheKey = await createCacheKey(voiceName, text);
-    const cached = await YTLLTTSCache.get(cacheKey);
+    validItems.push({ clientKey, text });
+  }
+  const candidates = await Promise.all(validItems.map(async item => ({
+    ...item,
+    cacheKey: await createCacheKey(voiceName, item.text)
+  })));
+  const cachedRecords = await YTLLTTSCache.getBatch(candidates.map(item => item.cacheKey));
+  if (generation !== audioCacheGeneration) {
+    throw new Error("Audio cache was cleared during the request.");
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    const { clientKey, text, cacheKey } = candidates[i];
+    const cached = cachedRecords[i];
     if (cached) {
       cachedItems.push({
         clientKey,
@@ -588,7 +610,7 @@ async function synthesizeBatchCached(items, voice) {
       batchedItems: uncachedItems.map(i => ({ clientKey: i.clientKey, text: i.text }))
     };
   } finally {
-    inFlight.delete(batchCacheIdentity);
+    if (inFlight.get(batchCacheIdentity) === batchSynthesis) inFlight.delete(batchCacheIdentity);
   }
 }
 
@@ -608,6 +630,7 @@ browser.runtime.onMessage.addListener(async message => {
       return await synthesizeBatchCached(message.items, message.voice);
     }
     if (message.type === "YTLL_TTS_CACHE_PUT") {
+      const generation = audioCacheGeneration;
       const settings = await getTtsSettings();
       const selectedVoice = message.voice || settings.azureVoice;
       validateVoice(selectedVoice);
@@ -615,6 +638,9 @@ browser.runtime.onMessage.addListener(async message => {
         throw new Error("Invalid TTS cache payload.");
       }
       const key = await createCacheKey(selectedVoice.trim(), message.text);
+      if (generation !== audioCacheGeneration) {
+        throw new Error("Audio cache was cleared during the request.");
+      }
       await YTLLTTSCache.put({
         key,
         arrayBuffer: fromBase64(message.audioBase64),
@@ -629,6 +655,8 @@ browser.runtime.onMessage.addListener(async message => {
       return { ok: true, audioBase64: toBase64(audio), mimeType: "audio/mpeg" };
     }
     if (message.type === "YTLL_TTS_CLEAR_CACHE") {
+      audioCacheGeneration++;
+      inFlight.clear();
       await YTLLTTSCache.clear();
       return { ok: true };
     }
@@ -717,11 +745,13 @@ browser.runtime.onMessage.addListener(async message => {
       return { ok: true };
     }
     if (message.type === "YTLL_CLEAR_ALL_CACHE") {
+      audioCacheGeneration++;
+      inFlight.clear();
       await YTLLCache.clearAll();
       return { ok: true };
     }
     return undefined;
   } catch (error) {
-    return { ok: false, reason: error && error.message ? error.message : "TTS request failed." };
+    return { ok: false, reason: error && error.message ? error.message : "Request failed." };
   }
 });

@@ -8,6 +8,8 @@ function createHarness(decodedAudio = null) {
   const sent = [];
   let pageListener;
   let storageListener;
+  let messageListener;
+  const revokedUrls = [];
   let pageHandler = async () => ({
     audioRes: { ok: false, reason: "No alternate audio tracks on this video" },
     subRes: { ok: true },
@@ -16,10 +18,12 @@ function createHarness(decodedAudio = null) {
   let runtimeHandler = async () => ({ ok: true });
   let decoderRate;
   const audios = [];
+  const intervals = new Map();
+  let nextInterval = 0;
   let time = 0;
   const videoListeners = new Map();
   const video = {
-    paused: true, muted: false, playbackRate: 1, volume: 1,
+    dataset: {}, paused: true, muted: false, playbackRate: 1, volume: 1,
     pauseCount: 0, playCount: 0, seekWasPaused: null,
     get currentTime() { return time; },
     set currentTime(value) {
@@ -81,7 +85,7 @@ function createHarness(decodedAudio = null) {
   const browser = {
     runtime: {
       getURL: value => value,
-      onMessage: { addListener() {} },
+      onMessage: { addListener(listener) { messageListener = listener; } },
       async sendMessage(message) {
         sent.push(message);
         return runtimeHandler(message);
@@ -94,7 +98,7 @@ function createHarness(decodedAudio = null) {
   };
   class MockURL extends URL {
     static createObjectURL() { return "blob:generated"; }
-    static revokeObjectURL() {}
+    static revokeObjectURL(url) { revokedUrls.push(url); }
   }
   const context = {
     window, browser, URL: MockURL, console, structuredClone,
@@ -110,7 +114,9 @@ function createHarness(decodedAudio = null) {
     atob: text => Buffer.from(text, "base64").toString("binary"),
     btoa: text => Buffer.from(text, "binary").toString("base64"),
     Blob,
-    setTimeout() { return 1; }, clearTimeout() {}, setInterval() {}
+    setTimeout() { return 1; }, clearTimeout() {},
+    setInterval(callback) { const id = ++nextInterval; intervals.set(id, callback); return id; },
+    clearInterval(id) { intervals.delete(id); }
   };
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
     .replace(/\}\)\(\);\s*$/, `
@@ -126,6 +132,26 @@ function createHarness(decodedAudio = null) {
           videoCacheSuppressed = true;
         },
         setPass(index) { currentPassIdx = index; },
+        setBlock(index) { currentBlockIdx = index; },
+        setRetainedCues(active, loaded, starting, preloaded) {
+          const key = index => makeDubCueKey(cues[index], index, cueTargetText(cues[index]));
+          activeDubCueKey = key(active);
+          loadedDubCueKey = key(loaded);
+          startingDubCueKey = key(starting);
+          preloadedDubCueKey = key(preloaded);
+        },
+        hasUrl(index) {
+          return dubAudioUrls.has(makeDubCueKey(cues[index], index, cueTargetText(cues[index])));
+        },
+        setTickerState(videoId, enabled, active, waitEnd, waitBuffer) {
+          currentVideoId = videoId;
+          settings.enabled = enabled;
+          loopActive = active;
+          waitingForDubEnd = waitEnd;
+          waitingForDubBuffer = waitBuffer;
+          syncLoopTickerState();
+        },
+        normalizeTtsSettings,
         addUrl(index, url) {
           const cue = cues[index];
           dubAudioUrls.set(makeDubCueKey(cue, index, cueTargetText(cue)), url);
@@ -137,7 +163,7 @@ function createHarness(decodedAudio = null) {
         },
         shouldPrefetchAiDub, shouldUseAiDub, ensureDubPrefetchForCurrentBlock,
         applyPassSettings, runTransition, generateBilingualCuesForDubbing,
-        findBatchSilences, splitBatchAudio, findDubCueIndexForTime,
+        findBatchSilences, splitBatchAudio, findDubCueIndexForTime, initForCurrentVideo,
         queue() { return translationQueue; },
         desired() { return Array.from(dubDesiredCueKeys); },
         currentResult() { return currentPassResult; },
@@ -147,7 +173,10 @@ function createHarness(decodedAudio = null) {
     })();`);
   vm.runInNewContext(source, context);
   return {
-    hooks: context.testHooks, video, sent, audios,
+    hooks: context.testHooks, video, window, sent, audios, revokedUrls,
+    intervalCount() { return intervals.size; },
+    tick() { for (const callback of [...intervals.values()]) callback(); },
+    message(message) { return messageListener(message); },
     setPageHandler(handler) { pageHandler = handler; },
     setRuntimeHandler(handler) { runtimeHandler = handler; },
     changeTts(value) { storageListener({ ttsSettings: { newValue: value } }, "local"); },
@@ -161,6 +190,131 @@ const passes = [
   { audio: "target", subtitles: "target", speed: 0.75 },
   { audio: "target", subtitles: "target", speed: 1 }
 ];
+
+test("prunes old and distant dub URLs while retaining adjacent blocks and playback decks", () => {
+  const h = createHarness();
+  const cues = Array.from({ length: 11 }, (_, i) => ({
+    start: i, end: i + 1, sourceText: `source ${i}`, targetText: `target ${i}`
+  }));
+  h.hooks.setup({ playbacks: passes, subtitlesPerLoop: 1 }, { dubMode: "force", azureKey: "key" }, cues);
+  cues.forEach((cue, i) => h.hooks.addUrl(i, `blob:${i}`));
+  h.hooks.setBlock(6);
+  h.hooks.setRetainedCues(0, 1, 2, 3);
+  h.hooks.ensureDubPrefetchForCurrentBlock();
+  assert.deepEqual(h.revokedUrls, ["blob:4", "blob:8", "blob:9", "blob:10"]);
+  for (const index of [0, 1, 2, 3, 5, 6, 7]) assert.equal(h.hooks.hasUrl(index), true);
+  for (const index of [4, 8, 9, 10]) assert.equal(h.hooks.hasUrl(index), false);
+  assert.equal(h.hooks.desired().length, 2);
+});
+
+test("runs the ticker only for active loops or outstanding dub waits", () => {
+  const h = createHarness();
+  h.hooks.setTickerState("", true, true, false, false);
+  assert.equal(h.intervalCount(), 0);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  assert.equal(h.intervalCount(), 1);
+  h.hooks.setTickerState("video1", false, true, false, false);
+  assert.equal(h.intervalCount(), 0);
+  h.hooks.setTickerState("video1", true, false, true, false);
+  assert.equal(h.intervalCount(), 1);
+  h.hooks.setTickerState("video1", true, false, false, true);
+  assert.equal(h.intervalCount(), 1);
+  h.hooks.setTickerState("video1", true, false, false, false);
+  assert.equal(h.intervalCount(), 0);
+});
+
+test("settings and navigation stop and restart the ticker", async () => {
+  const h = createHarness();
+  h.hooks.setup({ playbacks: passes }, { dubMode: "off" }, [
+    { start: 0, end: 1, sourceText: "source", targetText: "target" }
+  ]);
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.changeSettings({ enabled: false });
+  assert.equal(h.intervalCount(), 0);
+  h.changeSettings({ enabled: true });
+  assert.equal(h.intervalCount(), 1);
+  h.window.location.href = "https://www.youtube.com/";
+  await h.hooks.initForCurrentVideo();
+  assert.equal(h.intervalCount(), 0);
+});
+
+test("the ticker stops when the final block finishes", () => {
+  const h = createHarness();
+  h.hooks.setup({ playbacks: passes, numPlaybacks: 1 }, { dubMode: "off" }, [
+    { start: 0, end: 1, sourceText: "source", targetText: "target" }
+  ]);
+  h.video.paused = false;
+  h.video.currentTime = 1;
+  h.hooks.setTickerState("video1", true, true, false, false);
+  h.tick();
+  assert.equal(h.intervalCount(), 0);
+});
+
+test("normalizes the legacy Gemini key without retaining the obsolete property", () => {
+  const h = createHarness();
+  const normalized = h.hooks.normalizeTtsSettings({ geminiKey: "legacy" });
+  assert.equal(normalized.geminiApiKey, "legacy");
+  assert.equal("geminiKey" in normalized, false);
+});
+
+test("clearing audio cache revokes in-memory audio and restarts prefetch", async () => {
+  const h = createHarness();
+  const cues = [{ start: 0, end: 2, sourceText: "source", targetText: "target" }];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  h.hooks.addUrl(0, "blob:old");
+  h.setRuntimeHandler(() => new Promise(() => {}));
+  assert.equal((await h.message({ type: "YTLL_TTS_CACHE_CLEARED" })).ok, true);
+  assert.deepEqual(h.revokedUrls, ["blob:old"]);
+  assert.equal(h.sent.some(message => message.type === "YTLL_TTS_SYNTHESIZE_BATCH"), true);
+});
+
+test("clearing audio cache does not resume a video paused for dub buffering", async () => {
+  const h = createHarness();
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, [
+    { start: 0, end: 1, sourceText: "source", targetText: "target" }
+  ]);
+  h.hooks.setTickerState("video1", true, true, false, true);
+  h.setRuntimeHandler(() => new Promise(() => {}));
+  await h.message({ type: "YTLL_TTS_CACHE_CLEARED" });
+  assert.equal(h.video.paused, true);
+  assert.equal(h.video.playCount, 0);
+});
+
+test("clearing during audio decoding prevents stale split clips from being cached", async () => {
+  let finishDecode;
+  const decoded = new Promise(resolve => { finishDecode = resolve; });
+  const h = createHarness(decoded);
+  const cues = [
+    { start: 0, end: 1, sourceText: "first", targetText: "one" },
+    { start: 1, end: 2, sourceText: "second", targetText: "two" }
+  ];
+  h.hooks.setup({ playbacks: passes }, { dubMode: "force", azureKey: "key" }, cues);
+  let batchCount = 0;
+  h.setRuntimeHandler(message => {
+    if (message.type !== "YTLL_TTS_SYNTHESIZE_BATCH") return Promise.resolve({ ok: true });
+    if (batchCount++ > 0) return new Promise(() => {});
+    return Promise.resolve({
+      ok: true,
+      batchAudioBase64: "AA==",
+      batchedItems: message.items.map(item => ({ clientKey: item.key }))
+    });
+  });
+  h.hooks.ensureDubPrefetchForCurrentBlock();
+  for (let i = 0; i < 10 && !h.decoderRate(); i++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(h.decoderRate(), 24000);
+  await h.message({ type: "YTLL_TTS_CACHE_CLEARED" });
+  const samples = new Float32Array(48000).fill(0.1);
+  samples.fill(0, 12000, 38000);
+  finishDecode({
+    sampleRate: 24000, length: samples.length, numberOfChannels: 1,
+    getChannelData() { return samples; }
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.sent.some(message => message.type === "YTLL_TTS_CACHE_PUT"), false);
+});
 
 test("prefetches the whole first block on the source pass without activating dub playback", () => {
   const h = createHarness();

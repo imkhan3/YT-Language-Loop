@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 function createHarness() {
   const updates = [];
+  const cacheWrites = [];
   let messageListener;
   let translate = async () => ({ ok: true, translations: {} });
   let pageResult;
@@ -56,6 +57,7 @@ function createHarness() {
       async sendMessage(message) {
         if (message.type === "YTLL_TRANSCRIPT_UPDATED") updates.push(message);
         if (message.type === "YTLL_TRANSLATE_BATCH") return translate(message);
+        if (message.type === "YTLL_VIDEO_CACHE_PUT") cacheWrites.push(message);
         return { ok: true };
       }
     },
@@ -77,7 +79,8 @@ function createHarness() {
     structuredClone,
     setTimeout() { return 1; },
     clearTimeout() {},
-    setInterval() {}
+    setInterval() { return 1; },
+    clearInterval() {}
   };
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
     .replace(/\}\)\(\);\s*$/, `
@@ -110,6 +113,7 @@ function createHarness() {
     hooks: context.testHooks,
     message: message => messageListener(message),
     updates,
+    cacheWrites,
     video,
     window,
     setTranslate(fn) { translate = fn; },
@@ -210,6 +214,17 @@ test("publishes cue resets on reload and preserves cues when cache is cleared", 
   h.hooks.reloadCaptionsForCurrentVideo();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(plain(h.updates.at(-1).cues), []);
+});
+
+test("caches new translations after clearing the current video cache", async () => {
+  const h = createHarness();
+  h.hooks.seed("video1", structuredClone(sampleCues));
+  await h.message({ type: "YTLL_VIDEO_CACHE_CLEARED" });
+  h.setTranslate(async () => ({ ok: true, translations: { 1: "new translation" } }));
+  h.hooks.enableTranslation();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.cacheWrites.length, 1);
+  assert.equal(h.cacheWrites[0].cues[1].targetText, "new translation");
 });
 
 test("publishes an update after video cache persistence", async () => {

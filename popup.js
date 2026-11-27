@@ -450,6 +450,15 @@ async function clearTtsCache() {
     if (!result || !result.ok) {
       throw new Error(result?.reason || "Could not clear the audio cache.");
     }
+    try {
+      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+      if (tab && typeof tab.id === "number") {
+        const response = await browser.tabs.sendMessage(tab.id, { type: "YTLL_TTS_CACHE_CLEARED" });
+        if (response?.ok === false) throw new Error(response.reason || "Could not clear active audio.");
+      }
+    } catch (error) {
+      console.warn("Could not notify the active tab that audio cache was cleared:", error);
+    }
     showStatus("Audio cache cleared");
   } catch (err) {
     console.error("Failed to clear TTS cache:", err);

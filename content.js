@@ -18,7 +18,6 @@
   const DEFAULT_TTS_SETTINGS = {
     dubMode: "auto",
     geminiApiKey: "",
-    geminiKey: "",
     azureKey: "",
     azureRegion: "eastus",
     azureVoice: "ar-SA-HamedNeural",
@@ -861,6 +860,7 @@
     waitingForDubEnd = false;
     waitingForDubBuffer = false;
     pendingBlockTransition = null;
+    syncLoopTickerState();
     dubPrefetchSignature = "";
     dubPrefetchQueue = [];
     dubDesiredCueKeys = new Set();
@@ -1315,6 +1315,7 @@
     console.error("[YT Lang Loop] AI dub synthesis failed:", error);
     if (entry.key === activeDubCueKey && waitingForDubBuffer) {
       waitingForDubBuffer = false;
+      syncLoopTickerState();
       const video = getVideoElement();
       if (video?.paused) {
         video.play().catch(playError => {
@@ -1388,6 +1389,7 @@
         }
       }
 
+      if (generation !== dubCacheGeneration || videoId !== currentVideoId) return;
       if (splitAudio) {
         for (let i = 0; i < batchedItems.length; i++) {
           const entry = byKey.get(batchedItems[i].clientKey);
@@ -1414,6 +1416,7 @@
           .map(item => byKey.get(item.clientKey))
           .filter(Boolean);
         for (const entry of fallbackItems) {
+          if (generation !== dubCacheGeneration || videoId !== currentVideoId) return;
           try {
             await synthesizeCueIndividually(entry);
           } catch (error) {
@@ -1423,6 +1426,7 @@
       }
 
       for (const failed of result.failedItems || []) {
+        if (generation !== dubCacheGeneration || videoId !== currentVideoId) return;
         const entry = byKey.get(failed.clientKey);
         if (!entry) continue;
         try {
@@ -1506,6 +1510,23 @@
 
     const keepKeys = new Set(entries.map(entry => entry.key));
     dubDesiredCueKeys = keepKeys;
+    const retainedKeys = new Set([
+      ...keepKeys, activeDubCueKey, loadedDubCueKey, startingDubCueKey, preloadedDubCueKey
+    ]);
+    for (const block of blocks.slice(Math.max(0, currentBlockIdx - 1), currentBlockIdx)) {
+      for (let cueIdx = block.subStartNum - 1; cueIdx < block.subEndNum; cueIdx++) {
+        const cue = cues[cueIdx];
+        if (!cue) continue;
+        const text = cueTargetText(cue);
+        if (text) retainedKeys.add(makeDubCueKey(cue, cueIdx, text));
+      }
+    }
+    for (const [key, url] of dubAudioUrls) {
+      if (!retainedKeys.has(key)) {
+        URL.revokeObjectURL(url);
+        dubAudioUrls.delete(key);
+      }
+    }
     const signature = `${currentVideoId}:${currentBlockIdx}:${ttsSettings.azureVoice}:${activeCueIdx}`;
     const currentBlock = blocks[currentBlockIdx];
     const hasMissingTargetText = usingSrt && currentBlock &&
@@ -1695,6 +1716,7 @@
       preloadNextDubCue(activeDubCueIdx);
       if (waitingForDubBuffer) {
         waitingForDubBuffer = false;
+        syncLoopTickerState();
         if (dubFeedback === "AI Dub: Buffering cue…") clearDubFeedback();
         if (video.paused) {
           video.play().catch(error => {
@@ -1711,6 +1733,7 @@
         console.error("[YT Lang Loop] AI dub playback failed:", error);
         if (waitingForDubBuffer) {
           waitingForDubBuffer = false;
+          syncLoopTickerState();
           if (video.paused) {
             video.play().catch(playError => {
               showDubFeedback(playError.message || "Could not resume video after buffering failed", true);
@@ -1842,6 +1865,7 @@
         return;
       }
       waitingForDubEnd = false;
+      syncLoopTickerState();
       const video = getVideoElement();
       if (video) {
         const nextIdx = activeDubCueIdx + 1;
@@ -2172,9 +2196,8 @@
       return;
     }
 
-    const segment = cues.find(
-      (cue) => video.currentTime >= cue.start && video.currentTime < cue.end
-    );
+    const cueIdx = findCueIndexForTime(video.currentTime);
+    const segment = cueIdx >= 0 ? cues[cueIdx] : null;
     const targetText =
       segment && (subMode === "target" || subMode === "both") ? segment.targetText : "";
     const sourceText =
@@ -2413,6 +2436,7 @@
       } else if (loopActive && settings.enabled && blocks.length > 0) {
         applyPassSettings(currentPassIdx);
       }
+      syncLoopTickerState();
       updateHud();
     });
 
@@ -2542,8 +2566,19 @@
     hud.metaText.textContent = meta;
   }
 
+  function syncLoopTickerState() {
+    const shouldRun = (currentVideoId && settings.enabled && loopActive) ||
+      waitingForDubEnd || waitingForDubBuffer;
+    if (shouldRun && tickTimer === null) {
+      startLoopTicker();
+    } else if (!shouldRun && tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+      lastTickTime = null;
+    }
+  }
+
   function startLoopTicker() {
-    clearInterval(tickTimer);
     tickTimer = setInterval(() => {
       const video = getVideoElement();
       if (video) attachVideoListeners();
@@ -2652,6 +2687,7 @@
           loopActive = false;
           setDubMuteActive(false, video);
           video.playbackRate = 1.0;
+          syncLoopTickerState();
           updateHud();
         }
       }
@@ -2734,6 +2770,7 @@
       dubFeedback = "";
       dubFeedbackIsError = false;
       currentVideoId = "";
+      syncLoopTickerState();
       videoCacheSource = "none";
       videoCacheSavedAt = null;
       videoCacheSuppressed = false;
@@ -2764,6 +2801,7 @@
     }
 
     if (videoId === currentVideoId && cues.length > 0) {
+      syncLoopTickerState();
       ensureHudMounted();
       attachVideoListeners();
       updateHud();
@@ -2779,6 +2817,7 @@
     dubFeedback = "";
     dubFeedbackIsError = false;
     currentVideoId = videoId;
+    syncLoopTickerState();
     videoCacheSource = "none";
     videoCacheSavedAt = null;
     videoCacheSuppressed = false;
@@ -2880,7 +2919,6 @@
         ? stored.dubMode
         : DEFAULT_TTS_SETTINGS.dubMode,
       geminiApiKey,
-      geminiKey: geminiApiKey,
       azureKey: typeof stored.azureKey === "string" ? stored.azureKey : DEFAULT_TTS_SETTINGS.azureKey,
       azureRegion: typeof stored.azureRegion === "string" ? stored.azureRegion : DEFAULT_TTS_SETTINGS.azureRegion,
       azureVoice: typeof stored.azureVoice === "string" ? stored.azureVoice : DEFAULT_TTS_SETTINGS.azureVoice,
@@ -2959,6 +2997,12 @@
   }
 
   browser.runtime.onMessage.addListener(async message => {
+    if (message?.type === "YTLL_TTS_CACHE_CLEARED") {
+      stopDubPlayback(false);
+      clearDubAudioUrls();
+      if (shouldPrefetchAiDub()) ensureDubPrefetchForCurrentBlock();
+      return { ok: true };
+    }
     if (message?.type === "YTLL_GET_TRANSCRIPT") {
       if (!getVideoIdFromUrl()) {
         return {
@@ -2997,6 +3041,7 @@
         });
         if (!deleted?.ok) throw new Error(deleted?.reason || "Could not delete the active video cache.");
       }
+      videoCacheSuppressed = false;
       videoCacheSource = "none";
       videoCacheSavedAt = null;
       notifyTranscriptUpdated();
@@ -3086,6 +3131,7 @@
     const prevEnabled = settings.enabled;
 
     settings = { ...structuredClone(DEFAULT_SETTINGS), ...changes.settings.newValue };
+    syncLoopTickerState();
 
     const video = getVideoElement();
     const languagesChanged =
@@ -3158,7 +3204,7 @@
   // Start once DOM is ready
   async function boot() {
     await loadSettings();
-    startLoopTicker();
+    syncLoopTickerState();
 
     document.addEventListener("click", event => {
       const target = event.target;
